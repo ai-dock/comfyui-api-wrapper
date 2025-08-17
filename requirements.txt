@@ -1,0 +1,11 @@
+aiocache
+pydantic>=2.5.0
+aiobotocore
+aiofiles
+aiohttp
+fastapi>=0.104.0
+pathlib
+python-magic
+uvicorn[standard]>=0.24.0
+markdown
+python-dotenv>=1.0.0

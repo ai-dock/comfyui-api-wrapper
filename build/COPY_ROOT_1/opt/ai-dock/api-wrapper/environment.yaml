@@ -1,7 +1,0 @@
-name: comfyui-api
-channels:
-  - conda-forge
-dependencies:
-  - python=3.10
-  - uvicorn=0.23
-  - fastapi=0.103

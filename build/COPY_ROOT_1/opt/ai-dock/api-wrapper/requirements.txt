@@ -1,9 +1,0 @@
-aiocache
-pydantic>=2
-aiobotocore
-aiofiles
-aiohttp
-fastapi==0.103
-pathlib
-python-magic
-uvicorn==0.23
