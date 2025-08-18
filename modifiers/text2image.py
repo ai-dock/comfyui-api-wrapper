@@ -36,7 +36,7 @@ class Text2Image(BaseModifier):
             0.8700000000000001)
         self.workflow["4"]["inputs"]["ckpt_name"] = await self.modify_workflow_value(
             "ckpt_name",
-            "v1-5-pruned-emaonly.ckpt")
+            "v1-5-pruned-emaonly-fp16.safetensors")
         self.workflow["6"]["inputs"]["text"] = await self.modify_workflow_value(
             "prompt",
             "")

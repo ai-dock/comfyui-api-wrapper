@@ -4,11 +4,12 @@
     "modifications": {
       "prompt": "photograph of victorian woman with wings, sky clouds, meadow grass",
       "negative_prompt": "watermark, text",
+      "ckpt_name": "v1-5-pruned-emaonly-fp16.safetensors",
+      "input_image": "https://raw.githubusercontent.com/comfyanonymous/ComfyUI/refs/heads/master/input/example.png",
       "steps": 20,
       "cfg_scale": 8.0,
       "seed": -1,
-      "sampler_name": "dpmpp_2m",
-      "input_image": "https://raw.githubusercontent.com/comfyanonymous/ComfyUI/refs/heads/master/input/example.png"
+      "sampler_name": "dpmpp_2m"
     },
     "s3": {
       "access_key_id": "",

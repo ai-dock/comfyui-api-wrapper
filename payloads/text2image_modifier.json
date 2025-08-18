@@ -4,6 +4,7 @@
     "modifications": {
       "prompt": "A beautiful sunset over mountains, photorealistic",
       "negative_prompt": "blurry, low quality",
+      "ckpt_name": "v1-5-pruned-emaonly-fp16.safetensors",
       "steps": 30,
       "cfg_scale": 8.0,
       "width": 768,

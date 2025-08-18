@@ -46,7 +46,7 @@ class Image2Image(BaseModifier):
             "")
         self.workflow["14"]["inputs"]["ckpt_name"] = await self.modify_workflow_value(
             "ckpt_name",
-            "v1-5-pruned-emaonly.ckpt")
+            "v1-5-pruned-emaonly-fp16.safetensors")
         await super().apply_modifications()
 
         
