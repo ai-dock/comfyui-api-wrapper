@@ -1,25 +1,26 @@
 {
   "input": {
+    "request_id": "",
     "modifier": "Text2Image",
     "modifications": {
       "prompt": "A beautiful sunset over mountains, photorealistic",
       "negative_prompt": "blurry, low quality",
+      "ckpt_name": "v1-5-pruned-emaonly-fp16.safetensors",
       "steps": 30,
-      "cfg_scale": 7.5,
-      "width": 768,
-      "height": 768,
-      "seed": -1,
+      "cfg_scale": 8.0,
+      "width": 500,
+      "height": 500,
       "sampler_name": "dpmpp_2m"
     },
     "s3": {
       "access_key_id": "",
       "secret_access_key": "",
-      "endpoint_url": "https://s3.us-west-002.backblazeb2.com",
-      "bucket_name": "my-ai-outputs",
-      "region": "us-west-002"
+      "endpoint_url": "",
+      "bucket_name": "",
+      "region": ""
     },
     "webhook": {
-      "url": "https://myapi.com/webhook/comfyui-complete",
+      "url": "",
       "extra_params": {
         "user_id": "12345",
         "project_id": "abc-def"

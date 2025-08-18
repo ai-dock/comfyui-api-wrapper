@@ -8,6 +8,7 @@ from pathlib import Path
 
 from fastapi import FastAPI, Response, Body, Query
 from fastapi.responses import StreamingResponse, HTMLResponse
+from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from aiocache import Cache, SimpleMemoryCache
 import time
 import aiofiles
@@ -23,7 +24,27 @@ from workers.postprocess_worker import PostprocessWorker
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(root_path="/")
+app = FastAPI(
+    title="ComfyUI API Wrapper",
+    description="FastAPI wrapper for ComfyUI with queue management",
+    version="1.0.0",
+    redirect_slashes=False  # Disable automatic slash redirects
+)
+
+# Add middleware to handle reverse proxy headers
+@app.middleware("http")
+async def add_reverse_proxy_headers(request, call_next):
+    """Handle reverse proxy headers to prevent redirect issues"""
+    response = await call_next(request)
+    
+    # Prevent redirect issues by ensuring Location headers use relative paths
+    if "location" in response.headers:
+        location = response.headers["location"]
+        # If it's a redirect to the same path, remove it to prevent loops
+        if location.endswith("//") or location == str(request.url):
+            del response.headers["location"]
+    
+    return response
 
 # Cache configuration - no changes needed, workers handle progress tracking
 if CACHE_TYPE == "redis":
@@ -84,7 +105,7 @@ async def main():
 
 
 # ===== DOCUMENTATION ENDPOINT =====
-@app.get('/', response_class=HTMLResponse)
+@app.get('/', response_class=HTMLResponse, include_in_schema=False)
 async def documentation():
     """Serve the API documentation from README.md"""
     try:
@@ -588,21 +609,6 @@ def _serialize_result(result) -> dict:
             return {"data": str(result)}
     except Exception as e:
         return {"error": f"Serialization error: {str(e)}"}
-
-
-# ===== ORIGINAL ENDPOINTS (kept for backward compatibility) =====
-
-@app.post('/payload', response_model=Result, status_code=202)
-async def payload(
-    payload: Annotated[
-        Payload,
-        Body(
-            openapi_examples=Payload.get_openapi_examples()
-        ),
-    ],
-):
-    """Submit a new processing request (async) - legacy endpoint"""
-    return await generate(payload)
 
 
 @app.get('/result/{request_id}', response_model=Result, status_code=200)

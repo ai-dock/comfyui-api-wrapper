@@ -1,0 +1,29 @@
+{
+  "input": {
+    "request_id": "",
+    "modifier": "Image2Image",
+    "modifications": {
+      "prompt": "photograph of victorian woman with wings, sky clouds, meadow grass",
+      "negative_prompt": "watermark, text",
+      "ckpt_name": "v1-5-pruned-emaonly-fp16.safetensors",
+      "input_image": "https://raw.githubusercontent.com/comfyanonymous/ComfyUI/refs/heads/master/input/example.png",
+      "steps": 20,
+      "cfg_scale": 8.0,
+      "sampler_name": "dpmpp_2m"
+    },
+    "s3": {
+      "access_key_id": "",
+      "secret_access_key": "",
+      "endpoint_url": "",
+      "bucket_name": "",
+      "region": ""
+    },
+    "webhook": {
+      "url": "",
+      "extra_params": {
+        "user_id": "12345",
+        "project_id": "abc-def"
+      }
+    }
+  }
+}
