@@ -224,8 +224,8 @@ Create modifier classes bound to specific JSON workflow files:
 from modifiers.basemodifier import BaseModifier
 import random
 
-class Text2Image(BaseModifier):
-    WORKFLOW_JSON = "workflows/text2image.json"
+class Image2Image(BaseModifier):
+    WORKFLOW_JSON = "workflows/image2image.json"
     
     def __init__(self, modifications={}):
         super().__init__(modifications)
@@ -238,7 +238,7 @@ class Text2Image(BaseModifier):
             "prompt", "")
         # URLs are automatically downloaded and replaced
         self.workflow["10"]["inputs"]["image"] = await self.modify_workflow_value(
-            "input_image")
+            "https://example.com/image.jpg")
         
         # Call parent to handle URL downloads
         await super().apply_modifications()
@@ -263,7 +263,7 @@ The BaseModifier automatically:
 ```json
 {
   "input": {
-    "modifier": "Text2Image",
+    "modifier": "Image2Image",
     "modifications": {
       "prompt": "a beautiful sunset",
       "steps": 30,
