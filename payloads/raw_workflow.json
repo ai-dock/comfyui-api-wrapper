@@ -106,6 +106,20 @@
           "title": "Save Image"
         }
       }
+    },
+    "s3": {
+      "access_key_id": "",
+      "secret_access_key": "",
+      "endpoint_url": "",
+      "bucket_name": "",
+      "region": ""
+    },
+    "webhook": {
+      "url": "",
+      "extra_params": {
+        "user_id": "12345",
+        "project_id": "abc-def"
+      }
     }
   }
 }
