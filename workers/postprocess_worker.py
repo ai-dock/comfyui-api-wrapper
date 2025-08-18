@@ -68,13 +68,6 @@ class PostprocessWorker:
                         await self.upload_assets(request_id, s3_config, result)
                     else:
                         logger.info(f"No S3 configuration found for {request_id}, skipping upload")
-                    
-                    # Handle webhook - check payload first, then environment variables
-                    webhook_config = await self.get_webhook_config(request.input)
-                    if webhook_config:
-                        await self.send_webhook(webhook_config['url'], result, webhook_config.get('extra_params', {}))
-                    else:
-                        logger.info(f"No webhook configuration found for {request_id}")
                 else:
                     logger.info(f"No ComfyUI output for {request_id}, likely a failed job")
                     if hasattr(result, 'comfyui_response'):
@@ -105,6 +98,16 @@ class PostprocessWorker:
                     logger.error(f"Failed to update result store for {request_id}: {store_error}")
             
             finally:
+                # Handle webhook - check payload first, then environment variables
+                webhook_config = await self.get_webhook_config(request.input)
+                if webhook_config:
+                    try:
+                        await self.send_webhook(webhook_config['url'], result, webhook_config.get('extra_params', {}))
+                    except Exception as webhook_error:
+                        # Will not mark a 'completed' job job as failed
+                        logger.error(f"Failed to run webhook for {request_id}: {webhook_error}")
+                else:
+                    logger.info(f"No webhook configuration found for {request_id}")
                 # Mark the job as complete
                 self.postprocess_queue.task_done()
             
