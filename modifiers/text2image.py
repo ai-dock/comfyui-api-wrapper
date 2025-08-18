@@ -13,15 +13,14 @@ class Text2Image(BaseModifier):
     
     WORKFLOW_JSON = "workflows/text2image.json"
     
-    def __init__(self, modificafions={}):
-        super().__init__()
-        self.modificafions = modificafions
+    def __init__(self, modifications=None):
+        super().__init__(modifications)
 
     async def apply_modifications(self):
         timestr = time.strftime("%Y%m%d-%H%M%S")
         self.workflow["3"]["inputs"]["seed"] = await self.modify_workflow_value(
             "seed",
-            random.randint(0,2**32))
+            random.randint(0, 2**32))
         self.workflow["3"]["inputs"]["steps"] = await self.modify_workflow_value(
             "steps",
             20)
@@ -44,6 +43,3 @@ class Text2Image(BaseModifier):
             "negative_prompt",
             "")
         await super().apply_modifications()
-
-        
-           

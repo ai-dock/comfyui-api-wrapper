@@ -13,9 +13,9 @@ class Image2Image(BaseModifier):
     
     WORKFLOW_JSON = "workflows/image2image.json"
     
-    def __init__(self, modificafions={}):
+    def __init__(self, modifications={}):
         super().__init__()
-        self.modificafions = modificafions
+        self.modifications = modifications
 
     async def apply_modifications(self):
         timestr = time.strftime("%Y%m%d-%H%M%S")
