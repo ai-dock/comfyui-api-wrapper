@@ -1,5 +1,6 @@
 {
   "input": {
+    "request_id": "",
     "modifier": "Image2Image",
     "modifications": {
       "prompt": "photograph of victorian woman with wings, sky clouds, meadow grass",
@@ -8,7 +9,6 @@
       "input_image": "https://raw.githubusercontent.com/comfyanonymous/ComfyUI/refs/heads/master/input/example.png",
       "steps": 20,
       "cfg_scale": 8.0,
-      "seed": -1,
       "sampler_name": "dpmpp_2m"
     },
     "s3": {

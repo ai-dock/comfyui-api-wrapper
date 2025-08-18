@@ -1,5 +1,6 @@
 {
   "input": {
+    "request_id": "",
     "modifier": "Text2Image",
     "modifications": {
       "prompt": "A beautiful sunset over mountains, photorealistic",
@@ -7,9 +8,8 @@
       "ckpt_name": "v1-5-pruned-emaonly-fp16.safetensors",
       "steps": 30,
       "cfg_scale": 8.0,
-      "width": 768,
-      "height": 768,
-      "seed": -1,
+      "width": 500,
+      "height": 500,
       "sampler_name": "dpmpp_2m"
     },
     "s3": {
