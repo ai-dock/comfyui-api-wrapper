@@ -7,7 +7,7 @@ from datetime import datetime
 from pathlib import Path
 
 from fastapi import FastAPI, Response, Body, Query
-from fastapi.responses import StreamingResponse, HTMLResponse
+from fastapi.responses import Response, StreamingResponse, HTMLResponse
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from aiocache import Cache, SimpleMemoryCache
 import time
@@ -304,8 +304,9 @@ def markdown_to_html(markdown_text: str) -> str:
 
 
 # ===== ASYNC ENDPOINT (renamed from /payload) =====
-@app.post('/generate', response_model=Result, status_code=202)
+@app.post('/generate', response_model=Result)
 async def generate(
+    response: Response,
     payload: Annotated[
         Payload,
         Body(
@@ -327,15 +328,24 @@ async def generate(
         await preprocess_queue.put(request_id)
         
         logger.info(f"Queued request {request_id}")
+        response.status_code = 202
         return result_pending
     except Exception as e:
         logger.error(f"Failed to queue request {request_id}: {e}")
-        raise
+        response.status_code = 500  # Internal Server Error
+        failed_result = Result(
+            id=request_id,
+            status="failed",
+            message=f"Failed to queue request: {str(e)}"
+        )
+        return failed_result
+
 
 
 # ===== SYNCHRONOUS ENDPOINT =====
 @app.post('/generate/sync', response_model=Result, status_code=200)
 async def generate_sync(
+    response: Response,
     payload: Annotated[
         Payload,
         Body(
@@ -361,13 +371,20 @@ async def generate_sync(
         
         # Wait for completion using existing worker status updates
         result = await _wait_for_completion(request_id, timeout)
+        if result.status == "completed" or result.status == "success":
+            response.status_code = 200
+        elif result.status == "failed":
+            response.status_code = 422  # Treat most failures as client errors
+        else:
+            response.status_code = 500  # Generic fail
         return result
         
     except asyncio.TimeoutError:
         logger.warning(f"Request {request_id} timed out after {timeout} seconds")
+        response.status_code = 408
         timeout_result = Result(
             id=request_id, 
-            status="timeout", 
+            status="timeout",
             message=f"Request timed out after {timeout} seconds"
         )
         await response_store.set(request_id, timeout_result)
