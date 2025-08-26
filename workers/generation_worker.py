@@ -49,7 +49,14 @@ class GenerationWorker:
                     raise Exception(f"Request {request_id} not found in store")
                 if not result:
                     raise Exception(f"Result {request_id} not found in store")
-                
+
+                # Check for cancellation
+                if result and getattr(result, 'status', '') == 'cancelled':
+                    logger.info(f"PreprocessWorker {self.worker_id} skipping cancelled job: {request_id} - jumping to postprocess")
+                    await self.postprocess_queue.put(request_id)
+                    self.generation_queue.task_done()
+                    continue
+                    
                 # Submit workflow to ComfyUI
                 comfyui_job_id = await self.post_workflow(request)
                 logger.info(f"Submitted job {request_id} to ComfyUI as {comfyui_job_id}")
@@ -196,7 +203,6 @@ class GenerationWorker:
         except Exception as e:
             logger.debug(f"Error checking cache status: {e}")
             return False
-
     
     async def wait_for_completion_websocket(self, comfyui_job_id: str, request_id: str) -> Dict[str, Any]:
         """
@@ -227,6 +233,7 @@ class GenerationWorker:
                     start_time = asyncio.get_event_loop().time()
                     last_update_time = start_time
                     last_message_time = start_time
+                    last_cancellation_check = start_time
                     
                     # Progressive timeout strategy
                     initial_timeout = 30.0  # 30 seconds to receive first message
@@ -247,6 +254,15 @@ class GenerationWorker:
                             last_message_time = asyncio.get_event_loop().time()
                             # Reset retry count since we received a message
                             no_message_retry_count = 0
+
+                            current_time = asyncio.get_event_loop().time()
+                            if current_time - last_cancellation_check > 10.0:  # Check every 10 seconds
+                                if await self._check_if_cancelled(request_id):
+                                    logger.info(f"Job {request_id} was cancelled during generation - aborting WebSocket")
+                                    # Cancel the ComfyUI job
+                                    await self.cancel_comfyui_job(comfyui_job_id)
+                                    raise Exception(f"Job {request_id} was cancelled during generation")
+                                last_cancellation_check = current_time
                             
                             if msg.type == aiohttp.WSMsgType.TEXT:
                                 try:
@@ -491,6 +507,15 @@ class GenerationWorker:
         except Exception as e:
             logger.error(f"Failed to get result from general history: {e}")
             return {}
+
+    async def _check_if_cancelled(self, request_id: str) -> bool:
+        """Check if the job has been cancelled"""
+        try:
+            result = await self.response_store.get(request_id)
+            return result and getattr(result, 'status', '') == 'cancelled'
+        except Exception as e:
+            logger.warning(f"Error checking cancellation status for {request_id}: {e}")
+            return False
 
     async def cancel_comfyui_job(self, comfyui_job_id: str):
         """Cancel a running job in ComfyUI"""

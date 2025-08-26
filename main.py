@@ -375,11 +375,26 @@ async def generate_sync(
         else:
             response.status_code = 500  # Generic fail
         return result
-        
+
+    except asyncio.CancelledError:
+        # Client disconnected - mark as cancelled and let workers handle the rest
+        logger.info(f"Client disconnected for request {request_id} - marking as cancelled")
+        try:
+            result = await response_store.get(request_id)
+            if result:
+                result.status = "cancelled"
+                result.message = "Request cancelled due to client disconnection"
+                await response_store.set(request_id, result)
+                logger.info(f"Successfully marked {request_id} as cancelled")
+            else:
+                logger.warning(f"Could not find result for {request_id} to mark as cancelled")
+        except Exception as store_error:
+            logger.warning(f"Failed to update cancelled status for {request_id}: {store_error}")
+        raise # Properly close the connection
+
     except Exception as e:
         logger.error(f"Failed to process synchronous request {request_id}: {e}")
         raise
-
 
 # ===== STREAMING ENDPOINT =====
 @app.post('/generate/stream')
@@ -627,6 +642,43 @@ async def result(request_id: str, response: Response):
         response.status_code = 500
         return result
 
+@app.get('/cancel/{request_id}', status_code=200)
+async def cancel_request_simple(
+    request_id: str,
+    response: Response
+):
+    """Cancel a request by marking it as cancelled"""
+    try:
+        # Get the current result
+        result = await response_store.get(request_id)
+        
+        if not result:
+            response.status_code = 404
+            return {"error": f"Request {request_id} not found"}
+        
+        # Check if already in a terminal state
+        if result.status in ['completed', 'failed', 'timeout', 'cancelled']:
+            return {
+                "message": f"Request {request_id} is already {result.status}",
+                "status": result.status
+            }
+        
+        # Mark as cancelled
+        result.status = "cancelled"
+        result.message = "Request cancelled by client"
+        await response_store.set(request_id, result)
+        
+        logger.info(f"Cancelled request {request_id}")
+        
+        return {
+            "message": f"Successfully cancelled request {request_id}",
+            "status": "cancelled"
+        }
+        
+    except Exception as e:
+        logger.error(f"Failed to cancel request {request_id}: {e}")
+        response.status_code = 500
+        return {"error": f"Failed to cancel request: {str(e)}"}
 
 @app.get('/queue-info', response_model=dict)
 async def queue_info():
