@@ -17,6 +17,7 @@ COMFYUI_API_BASE = os.getenv('COMFYUI_API_BASE', 'http://127.0.0.1:8188')
 COMFYUI_API_PROMPT = urljoin(COMFYUI_API_BASE, '/prompt')
 COMFYUI_API_QUEUE = urljoin(COMFYUI_API_BASE, '/queue')
 COMFYUI_API_HISTORY = urljoin(COMFYUI_API_BASE, '/history')
+COMFYUI_API_INTERUPT = urljoin(COMFYUI_API_BASE, '/api/interrupt')
 
 # WebSocket endpoint (convert http to ws, https to wss)
 COMFYUI_API_WEBSOCKET = COMFYUI_API_BASE.replace('http://', 'ws://').replace('https://', 'wss://') + '/ws'

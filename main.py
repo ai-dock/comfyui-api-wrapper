@@ -340,8 +340,6 @@ async def generate(
         )
         return failed_result
 
-
-
 # ===== SYNCHRONOUS ENDPOINT =====
 @app.post('/generate/sync', response_model=Result, status_code=200)
 async def generate_sync(
@@ -352,7 +350,6 @@ async def generate_sync(
             openapi_examples=Payload.get_openapi_examples()
         ),
     ],
-    timeout: int = Query(default=300, description="Timeout in seconds")
 ):
     """Submit a new generation request and wait for completion (synchronous)"""
     if not payload.input.request_id:
@@ -370,7 +367,7 @@ async def generate_sync(
         logger.info(f"Queued synchronous request {request_id}")
         
         # Wait for completion using existing worker status updates
-        result = await _wait_for_completion(request_id, timeout)
+        result = await _wait_for_completion(request_id)
         if result.status == "completed" or result.status == "success":
             response.status_code = 200
         elif result.status == "failed":
@@ -379,16 +376,6 @@ async def generate_sync(
             response.status_code = 500  # Generic fail
         return result
         
-    except asyncio.TimeoutError:
-        logger.warning(f"Request {request_id} timed out after {timeout} seconds")
-        response.status_code = 408
-        timeout_result = Result(
-            id=request_id, 
-            status="timeout",
-            message=f"Request timed out after {timeout} seconds"
-        )
-        await response_store.set(request_id, timeout_result)
-        return timeout_result
     except Exception as e:
         logger.error(f"Failed to process synchronous request {request_id}: {e}")
         raise
@@ -437,12 +424,11 @@ async def generate_stream(
 
 # ===== HELPER FUNCTIONS =====
 
-async def _wait_for_completion(request_id: str, timeout: int) -> Result:
+async def _wait_for_completion(request_id: str) -> Result:
     """Poll for request completion using existing worker status updates"""
-    start_time = time.time()
     poll_interval = 0.5  # Poll every 500ms
     
-    while time.time() - start_time < timeout:
+    while True:
         result = await response_store.get(request_id)
         
         if result and hasattr(result, 'status'):
@@ -450,9 +436,6 @@ async def _wait_for_completion(request_id: str, timeout: int) -> Result:
                 return result
         
         await asyncio.sleep(poll_interval)
-    
-    raise asyncio.TimeoutError()
-
 
 async def _stream_status_updates(request_id: str):
     """Generator that yields Server-Sent Events for status updates using worker progress"""

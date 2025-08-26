@@ -6,7 +6,7 @@ import logging
 from typing import Optional, Dict, Any
 from datetime import datetime
 
-from config import COMFYUI_API_PROMPT, COMFYUI_API_HISTORY, COMFYUI_API_WEBSOCKET
+from config import COMFYUI_API_PROMPT, COMFYUI_API_HISTORY, COMFYUI_API_INTERRUPT, COMFYUI_API_WEBSOCKET
 
 logger = logging.getLogger(__name__)
 
@@ -403,11 +403,18 @@ class GenerationWorker:
                     return execution_result
                     
         except asyncio.TimeoutError:
+            logger.warning(f"WebSocket overall timeout for job {comfyui_job_id} - attempting to cancel")
+            await self.cancel_comfyui_job(comfyui_job_id)
             raise Exception(f"WebSocket timeout for job {comfyui_job_id}")
         except aiohttp.ClientError as e:
+            # Cancel the job since we can't monitor it anymore
+            logger.warning(f"WebSocket connection error for job {comfyui_job_id} - attempting to cancel")
+            await self.cancel_comfyui_job(comfyui_job_id)
             raise Exception(f"WebSocket connection error: {e}")
         except Exception as e:
             logger.error(f"WebSocket error for job {comfyui_job_id}: {e}")
+            # Cancel on other errors to be safe
+            await self.cancel_comfyui_job(comfyui_job_id)
             raise
 
     async def _update_progress(self, request_id: str, message: str):
@@ -484,3 +491,40 @@ class GenerationWorker:
         except Exception as e:
             logger.error(f"Failed to get result from general history: {e}")
             return {}
+
+    async def cancel_comfyui_job(self, comfyui_job_id: str):
+    """Cancel a running job in ComfyUI"""
+    try:       
+        if not COMFYUI_API_INTERRUPT:
+            logger.warning("COMFYUI_API_INTERRUPT not configured, cannot cancel job")
+            return False
+            
+        payload = {
+            "prompt_id": comfyui_job_id
+        }
+        
+        headers = {
+            'Content-Type': 'application/json'
+        }
+            
+        timeout = aiohttp.ClientTimeout(total=5.0)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            cancel_url = COMFYUI_API_INTERRUPT
+            
+            async with session.post(
+                cancel_url,
+                data=json.dumps(payload),
+                headers=headers
+            ) as response:
+                
+                if response.status == 200:
+                    logger.info(f"Successfully cancelled ComfyUI job {comfyui_job_id}")
+                    return True
+                else:
+                    response_text = await response.text()
+                    logger.warning(f"Failed to cancel ComfyUI job {comfyui_job_id}: HTTP {response.status} - {response_text}")
+                    return False
+                
+    except Exception as e:
+        logger.error(f"Error cancelling ComfyUI job {comfyui_job_id}: {e}")
+        return False
