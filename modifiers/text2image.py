@@ -26,16 +26,22 @@ class Text2Image(BaseModifier):
             20)
         self.workflow["3"]["inputs"]["sampler_name"] = await self.modify_workflow_value(
             "sampler_name",
-            "dpmpp_2m")
+            "euler")
         self.workflow["3"]["inputs"]["scheduler"] = await self.modify_workflow_value(
             "scheduler",
             "normal")
         self.workflow["3"]["inputs"]["denoise"] = await self.modify_workflow_value(
             "denoise",
-            0.8700000000000001)
+            1.0)
         self.workflow["4"]["inputs"]["ckpt_name"] = await self.modify_workflow_value(
             "ckpt_name",
             "v1-5-pruned-emaonly-fp16.safetensors")
+        self.workflow["5"]["inputs"]["width"] = await self.modify_workflow_value(
+            "prompt",
+            "512")
+        self.workflow["5"]["inputs"]["height"] = await self.modify_workflow_value(
+            "prompt",
+            "512")
         self.workflow["6"]["inputs"]["text"] = await self.modify_workflow_value(
             "prompt",
             "")
