@@ -6,7 +6,7 @@ from typing import Annotated, List
 from datetime import datetime
 from pathlib import Path
 
-from fastapi import FastAPI, Response, Body, Query
+from fastapi import FastAPI, Response, Body, Query, Request
 from fastapi.responses import Response, StreamingResponse, HTMLResponse
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from aiocache import Cache, SimpleMemoryCache
