@@ -367,7 +367,7 @@ async def generate_sync(
         logger.info(f"Queued synchronous request {request_id}")
         
         # Wait for completion using existing worker status updates
-        result = await _wait_for_completion(request_id)
+        result = await _wait_for_completion(request_id, request)
         if result.status == "completed" or result.status == "success":
             response.status_code = 200
         elif result.status == "failed":
@@ -381,7 +381,7 @@ async def generate_sync(
         logger.info(f"Client disconnected for request {request_id} - marking as cancelled")
         try:
             result = await response_store.get(request_id)
-            if result:
+            if result and result.status not in ['completed', 'failed', 'timeout', 'cancelled']:
                 result.status = "cancelled"
                 result.message = "Request cancelled due to client disconnection"
                 await response_store.set(request_id, result)
@@ -390,8 +390,7 @@ async def generate_sync(
                 logger.warning(f"Could not find result for {request_id} to mark as cancelled")
         except Exception as store_error:
             logger.warning(f"Failed to update cancelled status for {request_id}: {store_error}")
-        raise # Properly close the connection
-
+        raise  # Re-raise to properly close the connection
     except Exception as e:
         logger.error(f"Failed to process synchronous request {request_id}: {e}")
         raise
@@ -439,18 +438,30 @@ async def generate_stream(
 
 # ===== HELPER FUNCTIONS =====
 
-async def _wait_for_completion(request_id: str) -> Result:
-    """Poll for request completion using existing worker status updates"""
+async def _wait_for_completion(request_id: str, request: Request) -> Result:
+    """Poll for request completion with disconnect detection"""
     poll_interval = 0.5  # Poll every 500ms
+    disconnect_check_interval = 2.0  # Check for disconnect every 2 seconds
+    last_disconnect_check = time.time()
     
     while True:
+        # Check for client disconnect periodically
+        current_time = time.time()
+        if current_time - last_disconnect_check >= disconnect_check_interval:
+            if await request.is_disconnected():
+                logger.info(f"Client disconnected detected for request {request_id}")
+                raise asyncio.CancelledError("Client disconnected")
+            
+            last_disconnect_check = current_time
+        
         result = await response_store.get(request_id)
         
         if result and hasattr(result, 'status'):
-            if result.status in ['completed', 'failed', 'timeout']:
+            if result.status in ['completed', 'failed', 'timeout', 'cancelled']:
                 return result
         
         await asyncio.sleep(poll_interval)
+
 
 async def _stream_status_updates(request_id: str):
     """Generator that yields Server-Sent Events for status updates using worker progress"""
@@ -642,7 +653,7 @@ async def result(request_id: str, response: Response):
         response.status_code = 500
         return result
 
-@app.get('/cancel/{request_id}', status_code=200)
+@app.post('/cancel/{request_id}', status_code=200)
 async def cancel_request_simple(
     request_id: str,
     response: Response
@@ -678,7 +689,6 @@ async def cancel_request_simple(
     except Exception as e:
         logger.error(f"Failed to cancel request {request_id}: {e}")
         response.status_code = 500
-        return {"error": f"Failed to cancel request: {str(e)}"}
 
 @app.get('/queue-info', response_model=dict)
 async def queue_info():
