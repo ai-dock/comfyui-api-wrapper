@@ -39,6 +39,13 @@ class PreprocessWorker:
                     raise Exception(f"Request {request_id} not found in store")
                 if not result:
                     raise Exception(f"Result {request_id} not found in store")
+
+                # Check for cancellation
+                if result and getattr(result, 'status', '') == 'cancelled':
+                    logger.info(f"PreprocessWorker {self.worker_id} skipping cancelled job: {request_id} - jumping to postprocess")
+                    await self.postprocess_queue.put(request_id)
+                    self.preprocess_queue.task_done()
+                    continue
                 
                 # Get and initialize the workflow modifier
                 modifier = await self.get_workflow_modifier(

@@ -6,7 +6,7 @@ import logging
 from typing import Optional, Dict, Any
 from datetime import datetime
 
-from config import COMFYUI_API_PROMPT, COMFYUI_API_HISTORY, COMFYUI_API_WEBSOCKET
+from config import COMFYUI_API_PROMPT, COMFYUI_API_HISTORY, COMFYUI_API_INTERRUPT, COMFYUI_API_WEBSOCKET
 
 logger = logging.getLogger(__name__)
 
@@ -49,7 +49,14 @@ class GenerationWorker:
                     raise Exception(f"Request {request_id} not found in store")
                 if not result:
                     raise Exception(f"Result {request_id} not found in store")
-                
+
+                # Check for cancellation
+                if result and getattr(result, 'status', '') == 'cancelled':
+                    logger.info(f"PreprocessWorker {self.worker_id} skipping cancelled job: {request_id} - jumping to postprocess")
+                    await self.postprocess_queue.put(request_id)
+                    self.generation_queue.task_done()
+                    continue
+                    
                 # Submit workflow to ComfyUI
                 comfyui_job_id = await self.post_workflow(request)
                 logger.info(f"Submitted job {request_id} to ComfyUI as {comfyui_job_id}")
@@ -196,7 +203,6 @@ class GenerationWorker:
         except Exception as e:
             logger.debug(f"Error checking cache status: {e}")
             return False
-
     
     async def wait_for_completion_websocket(self, comfyui_job_id: str, request_id: str) -> Dict[str, Any]:
         """
@@ -227,6 +233,7 @@ class GenerationWorker:
                     start_time = asyncio.get_event_loop().time()
                     last_update_time = start_time
                     last_message_time = start_time
+                    last_cancellation_check = start_time
                     
                     # Progressive timeout strategy
                     initial_timeout = 30.0  # 30 seconds to receive first message
@@ -247,6 +254,15 @@ class GenerationWorker:
                             last_message_time = asyncio.get_event_loop().time()
                             # Reset retry count since we received a message
                             no_message_retry_count = 0
+
+                            current_time = asyncio.get_event_loop().time()
+                            if current_time - last_cancellation_check > 5.0:  # Check every 5 seconds
+                                if await self._check_if_cancelled(request_id):
+                                    logger.info(f"Job {request_id} was cancelled during generation - aborting WebSocket")
+                                    # Cancel the ComfyUI job
+                                    await self.cancel_comfyui_job(comfyui_job_id)
+                                    raise Exception(f"Job {request_id} was cancelled during generation")
+                                last_cancellation_check = current_time
                             
                             if msg.type == aiohttp.WSMsgType.TEXT:
                                 try:
@@ -403,11 +419,18 @@ class GenerationWorker:
                     return execution_result
                     
         except asyncio.TimeoutError:
+            logger.warning(f"WebSocket overall timeout for job {comfyui_job_id} - attempting to cancel")
+            await self.cancel_comfyui_job(comfyui_job_id)
             raise Exception(f"WebSocket timeout for job {comfyui_job_id}")
         except aiohttp.ClientError as e:
+            # Cancel the job since we can't monitor it anymore
+            logger.warning(f"WebSocket connection error for job {comfyui_job_id} - attempting to cancel")
+            await self.cancel_comfyui_job(comfyui_job_id)
             raise Exception(f"WebSocket connection error: {e}")
         except Exception as e:
             logger.error(f"WebSocket error for job {comfyui_job_id}: {e}")
+            # Cancel on other errors to be safe
+            await self.cancel_comfyui_job(comfyui_job_id)
             raise
 
     async def _update_progress(self, request_id: str, message: str):
@@ -484,3 +507,49 @@ class GenerationWorker:
         except Exception as e:
             logger.error(f"Failed to get result from general history: {e}")
             return {}
+
+    async def _check_if_cancelled(self, request_id: str) -> bool:
+        """Check if the job has been cancelled"""
+        try:
+            result = await self.response_store.get(request_id)
+            return result and getattr(result, 'status', '') == 'cancelled'
+        except Exception as e:
+            logger.warning(f"Error checking cancellation status for {request_id}: {e}")
+            return False
+
+    async def cancel_comfyui_job(self, comfyui_job_id: str):
+        """Cancel a running job in ComfyUI"""
+        try:       
+            if not COMFYUI_API_INTERRUPT:
+                logger.warning("COMFYUI_API_INTERRUPT not configured, cannot cancel job")
+                return False
+                
+            payload = {
+                "prompt_id": comfyui_job_id
+            }
+            
+            headers = {
+                'Content-Type': 'application/json'
+            }
+                
+            timeout = aiohttp.ClientTimeout(total=5.0)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                cancel_url = COMFYUI_API_INTERRUPT
+                
+                async with session.post(
+                    cancel_url,
+                    data=json.dumps(payload),
+                    headers=headers
+                ) as response:
+                    
+                    if response.status == 200:
+                        logger.info(f"Successfully cancelled ComfyUI job {comfyui_job_id}")
+                        return True
+                    else:
+                        response_text = await response.text()
+                        logger.warning(f"Failed to cancel ComfyUI job {comfyui_job_id}: HTTP {response.status} - {response_text}")
+                        return False
+                    
+        except Exception as e:
+            logger.error(f"Error cancelling ComfyUI job {comfyui_job_id}: {e}")
+            return False

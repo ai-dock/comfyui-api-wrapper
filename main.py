@@ -6,9 +6,13 @@ from typing import Annotated, List
 from datetime import datetime
 from pathlib import Path
 
-from fastapi import FastAPI, Response, Body, Query
-from fastapi.responses import Response, StreamingResponse, HTMLResponse
+from fastapi import FastAPI, Response, Body, Query, Request
+from fastapi.responses import Response, StreamingResponse, HTMLResponse, JSONResponse
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
+
+from contextlib import asynccontextmanager
+from anyio import create_task_group
+
 from aiocache import Cache, SimpleMemoryCache
 import time
 import aiofiles
@@ -33,18 +37,23 @@ app = FastAPI(
 
 # Add middleware to handle reverse proxy headers
 @app.middleware("http")
-async def add_reverse_proxy_headers(request, call_next):
+async def add_reverse_proxy_headers(request: Request, call_next):
     """Handle reverse proxy headers to prevent redirect issues"""
-    response = await call_next(request)
-    
-    # Prevent redirect issues by ensuring Location headers use relative paths
+    try:
+        response = await call_next(request)
+    except Exception as exc:
+        # If the route raised (like 499 disconnect), just re-raise
+        # or return a dummy JSONResponse to prevent noisy tracebacks.
+        raise
+
     if "location" in response.headers:
         location = response.headers["location"]
         # If it's a redirect to the same path, remove it to prevent loops
         if location.endswith("//") or location == str(request.url):
             del response.headers["location"]
-    
+
     return response
+
 
 # Cache configuration - no changes needed, workers handle progress tracking
 if CACHE_TYPE == "redis":
@@ -93,7 +102,7 @@ async def main():
     postprocess_tasks = [asyncio.create_task(worker.work()) for worker in postprocess_workers]
 
     logger.info(f"Started {len(preprocess_workers)} preprocess workers")
-    logger.info(f"Started {len(generation_workers)} generation workers") 
+    logger.info(f"Started {len(generation_workers)} generation workers")
     logger.info(f"Started {len(postprocess_workers)} postprocess workers")
 
     # Wait indefinitely
@@ -340,11 +349,34 @@ async def generate(
         )
         return failed_result
 
-
-
 # ===== SYNCHRONOUS ENDPOINT =====
-@app.post('/generate/sync', response_model=Result, status_code=200)
+@asynccontextmanager
+async def cancel_on_disconnect(request: Request, request_id: str):
+    """Cancel work if the client disconnects prematurely."""
+    async with create_task_group() as tg:
+        async def watch_disconnect():
+            try:
+                while True:
+                    message = await request.receive()
+                    if message["type"] == "http.disconnect":
+                        client = f'{request.client.host}:{request.client.port}' if request.client else '-:-'
+                        logger.info(f'{client} - "{request.method} {request.url.path}" 499 DISCONNECTED for {request_id}')
+                        await _mark_request_cancelled(request_id)
+                        tg.cancel_scope.cancel()
+                        break
+            except asyncio.CancelledError:
+                # Task cancelled by scope exit — swallow it
+                pass
+
+        tg.start_soon(watch_disconnect)
+        try:
+            yield
+        finally:
+            tg.cancel_scope.cancel()
+
+@app.post("/generate/sync", response_model=Result, status_code=200)
 async def generate_sync(
+    request: Request,
     response: Response,
     payload: Annotated[
         Payload,
@@ -352,47 +384,36 @@ async def generate_sync(
             openapi_examples=Payload.get_openapi_examples()
         ),
     ],
-    timeout: int = Query(default=300, description="Timeout in seconds")
 ):
-    """Submit a new generation request and wait for completion (synchronous)"""
     if not payload.input.request_id:
         payload.input.request_id = str(uuid.uuid4())
     request_id = payload.input.request_id
-    
+
     result_pending = Result(id=request_id)
+    await request_store.set(request_id, payload)
+    await response_store.set(request_id, result_pending)
+    await preprocess_queue.put(request_id)
+
+    logger.info(f"Queued synchronous request {request_id}")
 
     try:
-        # Store request and initial result
-        await request_store.set(request_id, payload)
-        await response_store.set(request_id, result_pending)
-        await preprocess_queue.put(request_id)
-        
-        logger.info(f"Queued synchronous request {request_id}")
-        
-        # Wait for completion using existing worker status updates
-        result = await _wait_for_completion(request_id, timeout)
-        if result.status == "completed" or result.status == "success":
-            response.status_code = 200
-        elif result.status == "failed":
-            response.status_code = 422  # Treat most failures as client errors
-        else:
-            response.status_code = 500  # Generic fail
-        return result
-        
-    except asyncio.TimeoutError:
-        logger.warning(f"Request {request_id} timed out after {timeout} seconds")
-        response.status_code = 408
-        timeout_result = Result(
-            id=request_id, 
-            status="timeout",
-            message=f"Request timed out after {timeout} seconds"
-        )
-        await response_store.set(request_id, timeout_result)
-        return timeout_result
-    except Exception as e:
-        logger.error(f"Failed to process synchronous request {request_id}: {e}")
-        raise
+        async with cancel_on_disconnect(request, request_id):
+            while True:
+                result = await response_store.get(request_id)
+                if result and result.status in ["completed", "failed", "timeout", "cancelled"]:
+                    return result
+                await asyncio.sleep(0.5)
 
+    except asyncio.CancelledError:
+        # Clean return instead of exception bubble
+        return JSONResponse(
+            status_code=499,
+            content=Result(
+                id=request_id,
+                status="cancelled",
+                message="Client closed connection"
+            ).__dict__,
+        )
 
 # ===== STREAMING ENDPOINT =====
 @app.post('/generate/stream')
@@ -437,22 +458,31 @@ async def generate_stream(
 
 # ===== HELPER FUNCTIONS =====
 
-async def _wait_for_completion(request_id: str, timeout: int) -> Result:
-    """Poll for request completion using existing worker status updates"""
-    start_time = time.time()
-    poll_interval = 0.5  # Poll every 500ms
-    
-    while time.time() - start_time < timeout:
+async def _mark_request_cancelled(request_id: str):
+    """Helper to mark a request as cancelled in the response store"""
+    try:
         result = await response_store.get(request_id)
-        
-        if result and hasattr(result, 'status'):
-            if result.status in ['completed', 'failed', 'timeout']:
-                return result
-        
-        await asyncio.sleep(poll_interval)
-    
-    raise asyncio.TimeoutError()
-
+        if result:
+            # Only update if not already in a terminal state
+            if result.status not in ['completed', 'failed', 'timeout', 'cancelled']:
+                result.status = "cancelled"
+                result.message = "Request cancelled due to client disconnection"
+                await response_store.set(request_id, result)
+                logger.info(f"Marked request {request_id} as cancelled")
+            else:
+                logger.debug(f"Request {request_id} already in terminal state: {result.status}")
+        else:
+            # Create a new cancelled result if none exists
+            cancelled_result = Result(
+                id=request_id,
+                status="cancelled",
+                message="Request cancelled due to client disconnection"
+            )
+            await response_store.set(request_id, cancelled_result)
+            logger.info(f"Created cancelled result for request {request_id}")
+            
+    except Exception as e:
+        logger.error(f"Failed to mark request {request_id} as cancelled: {e}")
 
 async def _stream_status_updates(request_id: str):
     """Generator that yields Server-Sent Events for status updates using worker progress"""
@@ -644,6 +674,42 @@ async def result(request_id: str, response: Response):
         response.status_code = 500
         return result
 
+@app.post('/cancel/{request_id}', status_code=200)
+async def cancel_request_simple(
+    request_id: str,
+    response: Response
+):
+    """Cancel a request by marking it as cancelled"""
+    try:
+        # Get the current result
+        result = await response_store.get(request_id)
+        
+        if not result:
+            response.status_code = 404
+            return {"error": f"Request {request_id} not found"}
+        
+        # Check if already in a terminal state
+        if result.status in ['completed', 'failed', 'timeout', 'cancelled']:
+            return {
+                "message": f"Request {request_id} is already {result.status}",
+                "status": result.status
+            }
+        
+        # Mark as cancelled
+        result.status = "cancelled"
+        result.message = "Request cancelled by client"
+        await response_store.set(request_id, result)
+        
+        logger.info(f"Cancelled request {request_id}")
+        
+        return {
+            "message": f"Successfully cancelled request {request_id}",
+            "status": "cancelled"
+        }
+        
+    except Exception as e:
+        logger.error(f"Failed to cancel request {request_id}: {e}")
+        response.status_code = 500
 
 @app.get('/queue-info', response_model=dict)
 async def queue_info():

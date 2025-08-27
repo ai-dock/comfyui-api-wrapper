@@ -8,6 +8,7 @@ from .config import (
     COMFYUI_API_PROMPT,
     COMFYUI_API_QUEUE,
     COMFYUI_API_HISTORY,
+    COMFYUI_API_INTERRUPT,
     COMFYUI_API_WEBSOCKET,
     
     # Cache Configuration
@@ -41,6 +42,7 @@ __all__ = [
     'COMFYUI_API_PROMPT',
     'COMFYUI_API_QUEUE',
     'COMFYUI_API_HISTORY',
+    'COMFYUI_API_INTERRUPT',
     'COMFYUI_API_WEBSOCKET',
     'CACHE_TYPE',
     'COMFYUI_INSTALL_DIR',
