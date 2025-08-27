@@ -256,7 +256,7 @@ class GenerationWorker:
                             no_message_retry_count = 0
 
                             current_time = asyncio.get_event_loop().time()
-                            if current_time - last_cancellation_check > 10.0:  # Check every 10 seconds
+                            if current_time - last_cancellation_check > 5.0:  # Check every 5 seconds
                                 if await self._check_if_cancelled(request_id):
                                     logger.info(f"Job {request_id} was cancelled during generation - aborting WebSocket")
                                     # Cancel the ComfyUI job
