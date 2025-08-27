@@ -375,7 +375,16 @@ async def cancel_on_disconnect(request: Request, request_id: str):
             tg.cancel_scope.cancel()
 
 @app.post("/generate/sync", response_model=Result, status_code=200)
-async def generate_sync(request: Request, payload: Payload):
+async def generate_sync(
+    request: Request,
+    response: Response,
+    payload: Annotated[
+        Payload,
+        Body(
+            openapi_examples=Payload.get_openapi_examples()
+        ),
+    ],
+):
     if not payload.input.request_id:
         payload.input.request_id = str(uuid.uuid4())
     request_id = payload.input.request_id
