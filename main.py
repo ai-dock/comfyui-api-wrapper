@@ -25,7 +25,7 @@ from workers.generation_worker import GenerationWorker
 from workers.postprocess_worker import PostprocessWorker
 
 # Configure logging
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.DEBUG if DEBUG_ENABLED else logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(
