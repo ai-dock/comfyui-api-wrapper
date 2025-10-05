@@ -17,6 +17,9 @@ logger = logging.getLogger(__name__)
 
 class BaseModifier:
     WORKFLOW_JSON = ""
+    RANDOM_INT_PLACEHOLDER = "__RANDOM_INT__"
+    RANDOM_INT_MIN = 0
+    RANDOM_INT_MAX = 2**32 - 1
   
     def __init__(self, modifications=None):
         self.modifications = modifications or {}
@@ -50,6 +53,24 @@ class BaseModifier:
             return default
         else:
             return self.modifications[key]
+
+    async def replace_random_ints(self, data):
+        """
+        Find and replace random int placeholders with a random integer.
+        Generally this will be used to create a random seed within a static workflow file
+        """
+        if isinstance(data, dict):
+            for key, value in data.items():
+                data[key] = await self.replace_random_ints(value)
+        elif isinstance(data, list):
+            for i, item in enumerate(data):
+                data[i] = await self.replace_random_ints(item)
+        elif isinstance(data, str) and self.RANDOM_INT_PLACEHOLDER in data:
+            # Replace the placeholder with a random integer
+            random_int = random.randint(self.RANDOM_INT_MIN, self.RANDOM_INT_MAX)
+            data = data.replace(self.RANDOM_INT_PLACEHOLDER, str(random_int))
+            logger.info(f"Replaced {self.RANDOM_INT_PLACEHOLDER} with {random_int}")
+        return data
 
     async def replace_workflow_urls(self, data):
         """
@@ -199,6 +220,7 @@ class BaseModifier:
           
     async def apply_modifications(self):
         """Apply all modifications to the workflow"""
+        await self.replace_random_ints(self.workflow)
         await self.replace_workflow_urls(self.workflow)
             
     async def get_modified_workflow(self):
