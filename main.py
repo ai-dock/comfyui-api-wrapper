@@ -17,7 +17,7 @@ from aiocache import Cache, SimpleMemoryCache
 import time
 import aiofiles
 
-from config import CACHE_TYPE, WORKER_CONFIG, DEBUG_ENABLED
+from config import CACHE_TYPE, WORKER_CONFIG, DEBUG_ENABLED, CACHE_TTL
 from requestmodels.models import Payload
 from responses.result import Result
 from workers.preprocess_worker import PreprocessWorker
@@ -57,11 +57,11 @@ async def add_reverse_proxy_headers(request: Request, call_next):
 
 # Cache configuration - no changes needed, workers handle progress tracking
 if CACHE_TYPE == "redis":
-    request_store = Cache(Cache.REDIS, namespace="request_store")
-    response_store = Cache(Cache.REDIS, namespace="response_store")
+    request_store = Cache(Cache.REDIS, namespace="request_store", ttl=CACHE_TTL)
+    response_store = Cache(Cache.REDIS, namespace="response_store", ttl=CACHE_TTL)
 else:
-    request_store = SimpleMemoryCache(namespace="request_store")
-    response_store = SimpleMemoryCache(namespace="response_store")
+    request_store = SimpleMemoryCache(namespace="request_store", ttl=CACHE_TTL)
+    response_store = SimpleMemoryCache(namespace="response_store", ttl=CACHE_TTL)
 
 # Processing queues (defined outside cache logic)
 preprocess_queue = asyncio.Queue()    
@@ -75,6 +75,9 @@ async def startup_event():
     try:
         asyncio.create_task(main())
         logger.info("Workers initialized successfully")
+        if CACHE_TYPE != "redis":
+            asyncio.create_task(cleanup_expired_cache())
+            logger.info("Watching for expired SimpleMemoryCache entries")
     except Exception as e:
         logger.error(f"Failed to initialize workers: {e}")
         raise
@@ -656,6 +659,23 @@ def _serialize_result(result) -> dict:
             return {"data": str(result)}
     except Exception as e:
         return {"error": f"Serialization error: {str(e)}"}
+
+async def cleanup_expired_cache():
+    """Periodically clean up expired result cache entries"""
+    while True:
+        await asyncio.sleep(3600)  # Every hour
+        try:
+            if CACHE_TYPE != "redis":  # Only for SimpleMemoryCache
+                # Force cleanup by checking all keys
+                if hasattr(response_store, '_cache'):
+                    expired_keys = []
+                    for key in list(response_store._cache.keys()):
+                        result = await response_store.get(key)
+                        if result is None:  # get() returns None for expired
+                            expired_keys.append(key)
+                    logger.info(f"Cleaned up {len(expired_keys)} expired cache entries")
+        except Exception as e:
+            logger.error(f"Cache cleanup error: {e}")
 
 
 @app.get('/result/{request_id}', response_model=Result, status_code=200)

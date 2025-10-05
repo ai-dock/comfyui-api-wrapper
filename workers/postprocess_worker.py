@@ -108,6 +108,12 @@ class PostprocessWorker:
                         logger.error(f"Failed to run webhook for {request_id}: {webhook_error}")
                 else:
                     logger.info(f"No webhook configuration found for {request_id}")
+                # Clean up the request store
+                try:
+                    await self.request_store.delete(request_id)
+                    logger.debug(f"Cleaned up request for {request_id}")
+                except Exception as e:
+                    logger.warning(f"Failed to clean up request for {request_id}: {e}")
                 # Mark the job as complete
                 self.postprocess_queue.task_done()
             
