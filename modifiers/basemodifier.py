@@ -101,6 +101,7 @@ class BaseModifier:
     
     async def download_file(self, url, target_dir):
         """Download file from URL to target directory"""
+        temp_filepath = None
         try:
             file_name_hash = self.get_url_hash(url)
             target_dir = Path(target_dir)
@@ -135,7 +136,7 @@ class BaseModifier:
                     
         except Exception as e:
             # Clean up temp file if it exists
-            if temp_filepath.exists():
+            if temp_filepath is not None and temp_filepath.exists():
                 temp_filepath.unlink()
             logger.error(f"Failed to download {url}: {e}")
             raise
