@@ -228,8 +228,8 @@ class BaseModifier:
           
     async def apply_modifications(self):
         """Apply all modifications to the workflow"""
-        self.replace_workflow_urls(self.workflow)
-        await self.replace_random_ints(self.workflow)
+        await self.replace_workflow_urls(self.workflow)
+        self.replace_random_ints(self.workflow)
             
     async def get_modified_workflow(self):
         """Get the workflow with all modifications applied"""
