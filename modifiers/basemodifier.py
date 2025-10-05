@@ -60,7 +60,7 @@ class BaseModifier:
         Find and replace random int placeholders with a random integer.
         Generally this will be used to create a random seed within a static workflow file
         """
-         if isinstance(data, dict):
+        if isinstance(data, dict):
             for key, value in data.items():
                 data[key] = await self.replace_random_ints(value)
         elif isinstance(data, list):
@@ -229,8 +229,8 @@ class BaseModifier:
           
     async def apply_modifications(self):
         """Apply all modifications to the workflow"""
-        await self.replace_random_ints(self.workflow)
         await self.replace_workflow_urls(self.workflow)
+        await self.replace_random_ints(self.workflow)
             
     async def get_modified_workflow(self):
         """Get the workflow with all modifications applied"""
