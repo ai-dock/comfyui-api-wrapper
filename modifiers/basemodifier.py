@@ -2,6 +2,7 @@ import asyncio
 import json
 import hashlib
 import logging
+import random
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -59,17 +60,25 @@ class BaseModifier:
         Find and replace random int placeholders with a random integer.
         Generally this will be used to create a random seed within a static workflow file
         """
-        if isinstance(data, dict):
+         if isinstance(data, dict):
             for key, value in data.items():
                 data[key] = await self.replace_random_ints(value)
         elif isinstance(data, list):
             for i, item in enumerate(data):
                 data[i] = await self.replace_random_ints(item)
-        elif isinstance(data, str) and self.RANDOM_INT_PLACEHOLDER in data:
-            # Replace the placeholder with a random integer
-            random_int = random.randint(self.RANDOM_INT_MIN, self.RANDOM_INT_MAX)
-            data = data.replace(self.RANDOM_INT_PLACEHOLDER, str(random_int))
-            logger.info(f"Replaced {self.RANDOM_INT_PLACEHOLDER} with {random_int}")
+        elif isinstance(data, str):
+            # Check if the entire string is the placeholder
+            if data == self.RANDOM_INT_PLACEHOLDER:
+                # Replace with actual integer, not string
+                random_int = random.randint(self.RANDOM_INT_MIN, self.RANDOM_INT_MAX)
+                logger.info(f"Replaced {self.RANDOM_INT_PLACEHOLDER} with {random_int}")
+                return random_int
+            # Check if placeholder is embedded in a string
+            elif self.RANDOM_INT_PLACEHOLDER in data:
+                # Replace within the string (keeps it as string)
+                random_int = random.randint(self.RANDOM_INT_MIN, self.RANDOM_INT_MAX)
+                data = data.replace(self.RANDOM_INT_PLACEHOLDER, str(random_int))
+                logger.info(f"Replaced {self.RANDOM_INT_PLACEHOLDER} in string with {random_int}")
         return data
 
     async def replace_workflow_urls(self, data):
