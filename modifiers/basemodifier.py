@@ -2,6 +2,7 @@ import asyncio
 import json
 import hashlib
 import logging
+import random
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -14,9 +15,11 @@ from config import INPUT_DIR
 
 logger = logging.getLogger(__name__)
 
-
 class BaseModifier:
     WORKFLOW_JSON = ""
+    RANDOM_INT_PLACEHOLDER = "__RANDOM_INT__"
+    RANDOM_INT_MIN = 0
+    RANDOM_INT_MAX = 2**32 - 1
   
     def __init__(self, modifications=None):
         self.modifications = modifications or {}
@@ -50,6 +53,32 @@ class BaseModifier:
             return default
         else:
             return self.modifications[key]
+
+    def replace_random_ints(self, data):
+        """
+        Find and replace random int placeholders with a random integer.
+        Generally this will be used to create a random seed within a static workflow file
+        """
+        if isinstance(data, dict):
+            for key, value in data.items():
+                data[key] = self.replace_random_ints(value)
+        elif isinstance(data, list):
+            for i, item in enumerate(data):
+                data[i] = self.replace_random_ints(item)
+        elif isinstance(data, str):
+            # Check if the entire string is the placeholder
+            if data == self.RANDOM_INT_PLACEHOLDER:
+                # Replace with actual integer, not string
+                random_int = random.randint(self.RANDOM_INT_MIN, self.RANDOM_INT_MAX)
+                logger.info(f"Replaced {self.RANDOM_INT_PLACEHOLDER} with {random_int}")
+                return random_int
+            # Check if placeholder is embedded in a string
+            elif self.RANDOM_INT_PLACEHOLDER in data:
+                # Replace within the string (keeps it as string)
+                random_int = random.randint(self.RANDOM_INT_MIN, self.RANDOM_INT_MAX)
+                data = data.replace(self.RANDOM_INT_PLACEHOLDER, str(random_int))
+                logger.info(f"Replaced {self.RANDOM_INT_PLACEHOLDER} in string with {random_int}")
+        return data
 
     async def replace_workflow_urls(self, data):
         """
@@ -200,6 +229,7 @@ class BaseModifier:
     async def apply_modifications(self):
         """Apply all modifications to the workflow"""
         await self.replace_workflow_urls(self.workflow)
+        self.replace_random_ints(self.workflow)
             
     async def get_modified_workflow(self):
         """Get the workflow with all modifications applied"""
