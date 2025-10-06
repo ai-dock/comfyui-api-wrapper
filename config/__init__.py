@@ -13,6 +13,7 @@ from .config import (
     
     # Cache Configuration
     CACHE_TYPE,
+    CACHE_TTL,
     
     # Directory Configuration
     COMFYUI_INSTALL_DIR,

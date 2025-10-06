@@ -17,7 +17,7 @@ from aiocache import Cache, SimpleMemoryCache
 import time
 import aiofiles
 
-from config import CACHE_TYPE, WORKER_CONFIG, DEBUG_ENABLED
+from config import CACHE_TYPE, WORKER_CONFIG, DEBUG_ENABLED, CACHE_TTL
 from requestmodels.models import Payload
 from responses.result import Result
 from workers.preprocess_worker import PreprocessWorker
@@ -57,11 +57,11 @@ async def add_reverse_proxy_headers(request: Request, call_next):
 
 # Cache configuration - no changes needed, workers handle progress tracking
 if CACHE_TYPE == "redis":
-    request_store = Cache(Cache.REDIS, namespace="request_store")
-    response_store = Cache(Cache.REDIS, namespace="response_store")
+    request_store = Cache(Cache.REDIS, namespace="request_store", ttl=CACHE_TTL)
+    response_store = Cache(Cache.REDIS, namespace="response_store", ttl=CACHE_TTL)
 else:
-    request_store = SimpleMemoryCache(namespace="request_store")
-    response_store = SimpleMemoryCache(namespace="response_store")
+    request_store = SimpleMemoryCache(namespace="request_store", ttl=CACHE_TTL)
+    response_store = SimpleMemoryCache(namespace="response_store", ttl=CACHE_TTL)
 
 # Processing queues (defined outside cache logic)
 preprocess_queue = asyncio.Queue()    

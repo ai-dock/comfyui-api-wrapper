@@ -24,6 +24,7 @@ COMFYUI_API_WEBSOCKET = COMFYUI_API_BASE.replace('http://', 'ws://').replace('ht
 
 # Cache configuration
 CACHE_TYPE = "redis" if os.getenv("API_CACHE", "").lower() == "redis" else "memory"
+CACHE_TTL = int(os.getenv("API_CACHE_TTL", 21600))  # 6 hours as default
 
 # Directory configuration using pathlib
 COMFYUI_INSTALL_DIR = Path(os.getenv('COMFYUI_INSTALL_PATH', '/workspace/ComfyUI'))
