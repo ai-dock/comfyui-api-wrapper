@@ -18,11 +18,12 @@ from workers.generation_worker import (
 def _reset_gpu_state():
     """The GPU latch is module-global; reset between tests so they
     don't leak state."""
-    _GPU_STATE["unrecoverable"] = False
-    _GPU_STATE["reason"] = ""
+    _GPU_STATE.clear()
     yield
-    _GPU_STATE["unrecoverable"] = False
-    _GPU_STATE["reason"] = ""
+    _GPU_STATE.clear()
+
+
+_BACKEND = "http://127.0.0.1:8188"
 
 
 @pytest.mark.parametrize("text", [
@@ -74,21 +75,19 @@ def test_cuda_unrecoverable_negative_returns_empty_string():
     assert _detect_cuda_unrecoverable_reason(None) == ""
 
 
-def test_gpu_state_round_trip():
-    s = get_gpu_state()
-    assert s == {"unrecoverable": False, "reason": ""}
-    mark_gpu_unrecoverable("illegal memory access")
-    s = get_gpu_state()
-    assert s == {"unrecoverable": True, "reason": "illegal memory access"}
+def test_gpu_state_round_trip_per_backend():
+    assert get_gpu_state(_BACKEND) == {"unrecoverable": False, "reason": ""}
+    mark_gpu_unrecoverable(_BACKEND, "illegal memory access")
+    assert get_gpu_state(_BACKEND) == {"unrecoverable": True, "reason": "illegal memory access"}
 
 
 def test_mark_gpu_unrecoverable_is_idempotent_first_wins():
     """Once latched, the originating reason is preserved — a later
     fault must not overwrite the first one (which is the most
     informative for debugging)."""
-    mark_gpu_unrecoverable("illegal memory access")
-    mark_gpu_unrecoverable("device-side assert triggered")
-    assert get_gpu_state() == {
+    mark_gpu_unrecoverable(_BACKEND, "illegal memory access")
+    mark_gpu_unrecoverable(_BACKEND, "device-side assert triggered")
+    assert get_gpu_state(_BACKEND) == {
         "unrecoverable": True,
         "reason": "illegal memory access",
     }
@@ -98,6 +97,33 @@ def test_mark_gpu_unrecoverable_handles_empty_reason():
     """Defensive: an empty reason string still latches the flag,
     but records a sentinel so downstream consumers see something
     rather than blank."""
-    mark_gpu_unrecoverable("")
-    assert get_gpu_state()["unrecoverable"] is True
-    assert get_gpu_state()["reason"] == "unspecified"
+    mark_gpu_unrecoverable(_BACKEND, "")
+    state = get_gpu_state(_BACKEND)
+    assert state["unrecoverable"] is True
+    assert state["reason"] == "unspecified"
+
+
+def test_gpu_state_aggregate_no_backends():
+    """No backends latched → aggregate is healthy."""
+    s = get_gpu_state()
+    assert s == {"unrecoverable": False, "reason": "", "by_backend": {}}
+
+
+def test_gpu_state_aggregate_one_backend_latched():
+    """One out of three latched → aggregate reports unrecoverable
+    and surfaces the bad backend's reason."""
+    mark_gpu_unrecoverable("http://127.0.0.1:8188", "illegal memory access")
+    # Two healthy backends — register them by querying state.
+    get_gpu_state("http://127.0.0.1:8189")
+    get_gpu_state("http://127.0.0.1:8190")
+    s = get_gpu_state()
+    assert s["unrecoverable"] is True
+    assert s["reason"] == "illegal memory access"
+    assert s["by_backend"]["http://127.0.0.1:8188"]["unrecoverable"] is True
+
+
+def test_gpu_state_isolates_per_backend():
+    """A latch on backend A must not affect backend B."""
+    mark_gpu_unrecoverable("http://a:8188", "illegal memory access")
+    assert get_gpu_state("http://a:8188")["unrecoverable"] is True
+    assert get_gpu_state("http://b:8188")["unrecoverable"] is False

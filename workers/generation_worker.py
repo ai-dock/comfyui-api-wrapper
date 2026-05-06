@@ -7,12 +7,8 @@ from typing import Optional, Dict, Any
 from datetime import datetime
 
 from config import (
-    COMFYUI_API_PROMPT,
-    COMFYUI_API_QUEUE,
-    COMFYUI_API_HISTORY,
-    COMFYUI_API_INTERRUPT,
-    COMFYUI_API_FREE,
-    COMFYUI_API_WEBSOCKET,
+    comfyui_urls,
+    COMFYUI_BACKENDS,
     WEBSOCKET_INITIAL_TIMEOUT,
     WEBSOCKET_MESSAGE_TIMEOUT,
     WEBSOCKET_MAX_NO_MESSAGE_RETRIES,
@@ -23,39 +19,67 @@ logger = logging.getLogger(__name__)
 
 
 # ----------------------------------------------------------------------
-# Module-level GPU-unrecoverable state.
+# Module-level GPU-unrecoverable state, keyed by backend URL.
 #
 # When the wrapper detects a GPU fault that ComfyUI's `/free` cannot
 # recover from (illegal memory access, misaligned address, device-side
-# assert, etc.), we latch the reason here. The wrapper's `/health`
-# endpoint reads it and reports 503 so an external health monitor /
-# orchestrator can replace the pod on a clean host.
+# assert, etc.), we latch the reason for that specific backend. The
+# wrapper's `/health` endpoint walks every backend and reports 503 if
+# any one is unrecoverable so an external health monitor can replace
+# the pod on a clean host.
 #
-# OOM is NOT considered unrecoverable — it gets handled inline via
-# `_attempt_oom_recovery()` calling ComfyUI's `/free`.
+# Multi-backend pods see one entry per ComfyUI process. OOM is NOT
+# considered unrecoverable — it gets handled inline via
+# `_attempt_oom_recovery()` calling that backend's `/free`.
 # ----------------------------------------------------------------------
-_GPU_STATE: Dict[str, Any] = {"unrecoverable": False, "reason": ""}
+_GPU_STATE: Dict[str, Dict[str, Any]] = {}
 
 
-def mark_gpu_unrecoverable(reason: str) -> None:
-    """Latch the GPU-unrecoverable flag. Idempotent — preserves the
-    first reason recorded so the operator sees the originating fault
-    rather than a downstream one."""
-    if not _GPU_STATE["unrecoverable"]:
-        _GPU_STATE["unrecoverable"] = True
-        _GPU_STATE["reason"] = reason or "unspecified"
-        logger.error(f"GPU latched as unrecoverable: {reason}")
+def mark_gpu_unrecoverable(backend_url: str, reason: str) -> None:
+    """Latch the GPU-unrecoverable flag for `backend_url`. Idempotent
+    per backend — preserves the first reason recorded so the operator
+    sees the originating fault rather than a downstream one."""
+    state = _GPU_STATE.setdefault(backend_url, {"unrecoverable": False, "reason": ""})
+    if not state["unrecoverable"]:
+        state["unrecoverable"] = True
+        state["reason"] = reason or "unspecified"
+        logger.error(f"GPU on {backend_url} latched as unrecoverable: {reason}")
 
 
-def get_gpu_state() -> Dict[str, Any]:
-    return dict(_GPU_STATE)
+def get_gpu_state(backend_url: Optional[str] = None) -> Dict[str, Any]:
+    """Without arg: aggregate {unrecoverable, reason, by_backend} —
+    `unrecoverable` is True if ANY backend is latched, `reason`
+    surfaces the first such backend's reason.
+
+    With arg: per-backend state {unrecoverable, reason}.
+    """
+    if backend_url is None:
+        per = {url: dict(s) for url, s in _GPU_STATE.items()}
+        any_bad = any(s["unrecoverable"] for s in per.values())
+        first_reason = next(
+            (s["reason"] for s in per.values() if s["unrecoverable"]), ""
+        )
+        return {
+            "unrecoverable": any_bad,
+            "reason":        first_reason,
+            "by_backend":    per,
+        }
+    return dict(_GPU_STATE.get(backend_url, {"unrecoverable": False, "reason": ""}))
 
 
 class GenerationWorker:
     """
-    Send payload to ComfyUI and await completion using WebSocket
+    Send payload to ComfyUI and await completion using WebSocket.
+
+    One GenerationWorker per ComfyUI backend. `backend_url` pins the
+    instance to its assigned ComfyUI process (e.g.
+    `http://127.0.0.1:8188`); all HTTP/WS endpoint URLs derive from
+    it via `comfyui_urls()`. N workers reading from the same
+    `generation_queue` form a natural pool — `asyncio.Queue.get()`
+    delivers each job to the first idle waiter, so backends are
+    used as they free up.
     """
-    def __init__(self, worker_id, kwargs):
+    def __init__(self, worker_id, kwargs, backend_url=None):
         self.worker_id = worker_id
         self.preprocess_queue = kwargs["preprocess_queue"]
         self.generation_queue = kwargs["generation_queue"]
@@ -63,15 +87,28 @@ class GenerationWorker:
         self.request_store = kwargs["request_store"]
         self.response_store = kwargs["response_store"]
 
+        # Backend URL + per-instance endpoint cache. Defaults to the
+        # first configured backend so older callers (and tests) that
+        # don't pass `backend_url` still work.
+        self.backend_url = (backend_url or COMFYUI_BACKENDS[0]).rstrip('/')
+        self._urls = comfyui_urls(self.backend_url)
+        self.api_prompt    = self._urls["prompt"]
+        self.api_queue     = self._urls["queue"]
+        self.api_history   = self._urls["history"]
+        self.api_interrupt = self._urls["interrupt"]
+        self.api_free      = self._urls["free"]
+        self.ws_url        = self._urls["websocket"]
+
         # Configuration
         self.max_wait_time = 3600  # 1 hour maximum wait
-        self.ws_url = COMFYUI_API_WEBSOCKET
-        self.client_id = f"worker_{worker_id}_{datetime.now().timestamp()}"
+        # Distinct client_id per backend so ComfyUI's own connection
+        # tracking sees them as independent clients.
+        self.client_id = f"worker_{worker_id}_{self.backend_url.rsplit(':', 1)[-1]}_{datetime.now().timestamp()}"
 
-        # Under supervisord (or any process supervisor co-launching the
-        # wrapper alongside ComfyUI) the wrapper can come up before
-        # ComfyUI is listening; the first POST then fails. Latch
-        # readiness on first job and skip the probe thereafter.
+        # Under supervisord (or any process supervisor co-launching
+        # the wrapper alongside ComfyUI) the wrapper can come up
+        # before ComfyUI is listening; the first POST then fails.
+        # Latch readiness on first job and skip the probe thereafter.
         self._comfy_ready = False
 
     async def work(self):
@@ -186,23 +223,25 @@ class GenerationWorker:
                 error_message = str(e)
                 logger.error(f"GenerationWorker {self.worker_id} failed job {request_id}: {e}")
 
-                # OOM is recoverable — call ComfyUI's /free to unload
-                # models and reset VRAM, then move on. The job itself
-                # is still failed (we won't retry it here), but the
-                # next request to this pod will start clean.
+                # OOM is recoverable — call THIS backend's /free to
+                # unload models and reset its VRAM, then move on.
+                # The job itself is still failed (we won't retry it
+                # here), but the next request that lands on this
+                # backend starts clean. Other backends are
+                # unaffected.
                 if _detect_oom_error(error_message):
-                    logger.warning(f"OOM detected for {request_id} — calling /free")
-                    if await _attempt_oom_recovery():
-                        logger.info("OOM recovery succeeded; pod stays healthy")
+                    logger.warning(f"OOM on {self.backend_url} for {request_id} — calling /free")
+                    if await self._attempt_oom_recovery():
+                        logger.info(f"OOM recovery succeeded on {self.backend_url}")
                     else:
-                        logger.error("OOM recovery failed; pod stays alive but next job may also OOM")
+                        logger.error(f"OOM recovery failed on {self.backend_url}; next job may also OOM")
                 else:
-                    # Non-OOM CUDA fault → mark the GPU unrecoverable.
-                    # /health will then return 503 so an external
-                    # health monitor can replace the pod.
+                    # Non-OOM CUDA fault → mark THIS backend's GPU
+                    # unrecoverable. /health returns 503 if any
+                    # backend is latched.
                     cuda_reason = _detect_cuda_unrecoverable_reason(error_message)
                     if cuda_reason:
-                        mark_gpu_unrecoverable(cuda_reason)
+                        mark_gpu_unrecoverable(self.backend_url, cuda_reason)
 
                 try:
                     # Update result to show failure
@@ -245,7 +284,7 @@ class GenerationWorker:
 
             try:
                 async with aiohttp.ClientSession(timeout=http_timeout) as session:
-                    async with session.get(COMFYUI_API_HISTORY) as resp:
+                    async with session.get(self.api_history) as resp:
                         # 200 means the history endpoint replied;
                         # 404 means ComfyUI is up but the URL form is
                         # slightly different — both indicate listening.
@@ -297,14 +336,14 @@ class GenerationWorker:
         for attempt in range(1, max_attempts + 1):
             try:
                 async with aiohttp.ClientSession(timeout=timeout) as session:
-                    logger.debug(f"Posting workflow to {COMFYUI_API_PROMPT} (attempt {attempt}/{max_attempts})")
+                    logger.debug(f"Posting workflow to {self.api_prompt} (attempt {attempt}/{max_attempts})")
                     logger.debug(
                         f"Workflow keys: "
                         f"{list(request.input.workflow_json.keys()) if isinstance(request.input.workflow_json, dict) else 'not a dict'}"
                     )
 
                     async with session.post(
-                        COMFYUI_API_PROMPT,
+                        self.api_prompt,
                         data=json.dumps(payload),
                         headers=headers
                     ) as response:
@@ -365,7 +404,7 @@ class GenerationWorker:
         timeout = aiohttp.ClientTimeout(total=5)
         try:
             async with aiohttp.ClientSession(timeout=timeout) as session:
-                url = f"{COMFYUI_API_HISTORY}/{comfyui_job_id}"
+                url = f"{self.api_history}/{comfyui_job_id}"
                 async with session.get(url) as response:
                     if response.status == 200:
                         history_data = await response.json()
@@ -383,7 +422,7 @@ class GenerationWorker:
         timeout = aiohttp.ClientTimeout(total=5)
         try:
             async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.get(COMFYUI_API_QUEUE) as response:
+                async with session.get(self.api_queue) as response:
                     if response.status != 200:
                         return False
                     data = await response.json()
@@ -436,7 +475,7 @@ class GenerationWorker:
                 # ComfyUI accepts {"clear": true, "delete": [<id>...]}
                 # against /history.
                 async with session.post(
-                    COMFYUI_API_HISTORY,
+                    self.api_history,
                     json={"delete": [comfyui_job_id]},
                     headers={"Content-Type": "application/json"},
                 ) as response:
@@ -762,7 +801,7 @@ class GenerationWorker:
 
         try:
             async with aiohttp.ClientSession(timeout=timeout) as session:
-                url = f"{COMFYUI_API_HISTORY}/{comfyui_job_id}"
+                url = f"{self.api_history}/{comfyui_job_id}"
                 logger.debug(f"Fetching result from: {url}")
 
                 async with session.get(url) as response:
@@ -797,7 +836,7 @@ class GenerationWorker:
         try:
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 # Try the general history endpoint
-                url = COMFYUI_API_HISTORY.rstrip(f"/{comfyui_job_id}")
+                url = self.api_history.rstrip(f"/{comfyui_job_id}")
                 logger.debug(f"Trying general history endpoint: {url}")
 
                 async with session.get(url) as response:
@@ -828,12 +867,16 @@ class GenerationWorker:
             return False
 
     async def cancel_comfyui_job(self, comfyui_job_id: str):
-        """Cancel a running job in ComfyUI"""
-        try:
-            if not COMFYUI_API_INTERRUPT:
-                logger.warning("COMFYUI_API_INTERRUPT not configured, cannot cancel job")
-                return False
+        """Cancel a running job on THIS worker's ComfyUI backend.
 
+        ComfyUI's /api/interrupt cancels whatever the backend is
+        currently running — the prompt_id in the body is hint/audit
+        only. Calling it on the right backend matters in a multi-
+        backend setup; the gen_worker that's awaiting this job's WS
+        is the same instance whose `cancel_comfyui_job` gets invoked,
+        so the routing is automatic.
+        """
+        try:
             payload = {
                 "prompt_id": comfyui_job_id
             }
@@ -844,7 +887,7 @@ class GenerationWorker:
 
             timeout = aiohttp.ClientTimeout(total=5.0)
             async with aiohttp.ClientSession(timeout=timeout) as session:
-                cancel_url = COMFYUI_API_INTERRUPT
+                cancel_url = self.api_interrupt
 
                 async with session.post(
                     cancel_url,
@@ -867,9 +910,40 @@ class GenerationWorker:
             logger.error(f"Error cancelling ComfyUI job {comfyui_job_id}: {e}")
             return False
 
+    async def _attempt_oom_recovery(self) -> bool:
+        """POST to THIS backend's /free to unload models and clear
+        its CUDA cache. Returns True on success.
+
+        Per-backend so OOM on one ComfyUI process doesn't unload
+        models from a sibling process that's mid-generation."""
+        payload = {"unload_models": True, "free_memory": True}
+        timeout = aiohttp.ClientTimeout(total=30)
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                logger.info(f"OOM recovery: POST {self.api_free}")
+                async with session.post(
+                    self.api_free,
+                    json=payload,
+                    headers={"Content-Type": "application/json"},
+                ) as response:
+                    if response.status == 200:
+                        logger.info(f"OOM recovery on {self.backend_url}: models unloaded, VRAM freed")
+                        return True
+                    body = await response.text()
+                    logger.warning(
+                        f"OOM recovery on {self.backend_url} returned HTTP {response.status}: {body[:200]}"
+                    )
+                    return False
+        except asyncio.TimeoutError:
+            logger.warning(f"OOM recovery on {self.backend_url} timed out")
+            return False
+        except Exception as e:
+            logger.error(f"OOM recovery on {self.backend_url} error: {e}")
+            return False
+
 
 # ----------------------------------------------------------------------
-# Module-level error classifiers + recovery helpers.
+# Module-level error classifiers.
 # ----------------------------------------------------------------------
 
 _OOM_TRIGGERS = (
@@ -921,35 +995,3 @@ def _detect_cuda_unrecoverable_reason(text: str) -> str:
     return ""
 
 
-async def _attempt_oom_recovery() -> bool:
-    """POST to ComfyUI's /free to unload all models and clear the
-    CUDA cache. Returns True on success."""
-    if not COMFYUI_API_FREE:
-        logger.warning("COMFYUI_API_FREE not configured; cannot attempt OOM recovery")
-        return False
-
-    payload = {"unload_models": True, "free_memory": True}
-    timeout = aiohttp.ClientTimeout(total=30)
-
-    try:
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            logger.info(f"OOM recovery: POST {COMFYUI_API_FREE}")
-            async with session.post(
-                COMFYUI_API_FREE,
-                json=payload,
-                headers={"Content-Type": "application/json"},
-            ) as response:
-                if response.status == 200:
-                    logger.info("OOM recovery: models unloaded, VRAM freed")
-                    return True
-                body = await response.text()
-                logger.warning(
-                    f"OOM recovery returned HTTP {response.status}: {body[:200]}"
-                )
-                return False
-    except asyncio.TimeoutError:
-        logger.warning("OOM recovery timed out")
-        return False
-    except Exception as e:
-        logger.error(f"OOM recovery error: {e}")
-        return False

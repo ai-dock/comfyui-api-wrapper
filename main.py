@@ -19,7 +19,10 @@ import time
 import aiofiles
 
 import aiohttp
-from config import CACHE_TYPE, WORKER_CONFIG, DEBUG_ENABLED, CACHE_TTL, COMFYUI_API_SYSTEM_STATS
+from config import (
+    CACHE_TYPE, WORKER_CONFIG, DEBUG_ENABLED, CACHE_TTL,
+    COMFYUI_API_SYSTEM_STATS, COMFYUI_BACKENDS, comfyui_urls,
+)
 from requestmodels.models import Payload
 from responses.result import Result
 from workers.preprocess_worker import PreprocessWorker
@@ -125,9 +128,17 @@ async def main():
     preprocess_workers = [PreprocessWorker(i, worker_config) for i in range(1, WORKER_CONFIG["preprocess_workers"] + 1)]
     preprocess_tasks = [asyncio.create_task(worker.work()) for worker in preprocess_workers]
 
-    # Generation workers from configuration
-    generation_workers = [GenerationWorker(i, worker_config) for i in range(1, WORKER_CONFIG["generation_workers"] + 1)]
+    # Generation workers — one per configured ComfyUI backend.
+    # Each is pinned to its backend's URL; N workers reading from
+    # the same `generation_queue` form a natural pool. The legacy
+    # `WORKER_CONFIG["generation_workers"]` knob is ignored when
+    # `COMFYUI_BACKENDS` is set (count is implicit from the list).
+    generation_workers = [
+        GenerationWorker(i + 1, worker_config, backend_url=url)
+        for i, url in enumerate(COMFYUI_BACKENDS)
+    ]
     generation_tasks = [asyncio.create_task(worker.work()) for worker in generation_workers]
+    logger.info(f"Generation workers bound to backends: {COMFYUI_BACKENDS}")
 
     postprocess_workers = [PostprocessWorker(i, worker_config) for i in range(1, WORKER_CONFIG["postprocess_workers"] + 1)]
     postprocess_tasks = [asyncio.create_task(worker.work()) for worker in postprocess_workers]
@@ -803,74 +814,87 @@ async def queue_info():
 async def health(response: Response):
     """Health check endpoint.
 
-    Returns 200 + {"status": "healthy", ...} only when:
-      * ComfyUI's HTTP /system_stats responds 200
-      * ComfyUI's WebSocket accepts a connect probe
-      * No CUDA-unrecoverable fault has been latched by the
-        generation worker (illegal memory access, device-side
-        assert, etc.)
+    Walks every configured ComfyUI backend (`COMFYUI_BACKENDS`)
+    plus the per-backend GPU latch. Returns 200 + healthy only when
+    ALL backends pass HTTP + WS probes AND no GPU is latched as
+    unrecoverable. Returns 503 if any backend fails — losing one
+    ComfyUI process means losing 1/N of the pod's capacity, and
+    replacing the whole pod is the simplest correct response for
+    most orchestrators.
 
-    Returns 503 + {"status": "unhealthy", ...} otherwise. An
-    external health monitor / orchestrator polling this endpoint
-    can replace the pod on a clean host when it goes unhealthy.
+    Body shape exposes both an aggregate (`status`, `gpu`,
+    `backends_healthy`) and per-backend detail (`backends[]`) so
+    operators can see which backend failed without parsing logs.
     """
     from workers.generation_worker import get_gpu_state
 
+    backends_detail = []
+    n_healthy = 0
+
+    async def _probe(urls: dict) -> dict:
+        """One backend's HTTP + WS probe."""
+        info = {
+            "base":         urls["base"],
+            "http_ok":      False,
+            "websocket_ok": False,
+        }
+        try:
+            t = aiohttp.ClientTimeout(total=5)
+            async with aiohttp.ClientSession(timeout=t) as session:
+                async with session.get(urls["system_stats"]) as r:
+                    if r.status == 200:
+                        info["http_ok"] = True
+                        info["system_stats"] = await r.json()
+                    else:
+                        info["http_error"] = f"system_stats returned {r.status}"
+        except aiohttp.ClientError as e:
+            info["http_error"] = f"connect failed: {e}"
+        except Exception as e:
+            info["http_error"] = f"unexpected: {e}"
+
+        try:
+            t = aiohttp.ClientTimeout(total=2.0)
+            async with aiohttp.ClientSession(timeout=t) as session:
+                async with session.ws_connect(
+                    urls["websocket"], params={"clientId": "healthcheck"}
+                ) as ws:
+                    info["websocket_ok"] = True
+                    await ws.close()
+        except Exception as e:
+            info["websocket_error"] = f"{e}"
+
+        return info
+
+    for backend_url in COMFYUI_BACKENDS:
+        urls = comfyui_urls(backend_url)
+        info = await _probe(urls)
+        # Per-backend GPU latch.
+        gpu_state = get_gpu_state(backend_url)
+        info["gpu"] = gpu_state
+        info["healthy"] = (
+            info["http_ok"]
+            and info["websocket_ok"]
+            and not gpu_state["unrecoverable"]
+        )
+        if info["healthy"]:
+            n_healthy += 1
+        backends_detail.append(info)
+
+    aggregate_gpu = get_gpu_state()
     health_response = {
-        "status": "healthy",
+        "status": "healthy" if n_healthy == len(COMFYUI_BACKENDS) else "unhealthy",
         "cache_type": CACHE_TYPE,
         "queues": {
             "preprocess": preprocess_queue.qsize(),
             "generation": generation_queue.qsize(),
             "postprocess": postprocess_queue.qsize(),
         },
-        "comfyui": {"http_ok": False, "websocket_ok": False},
-        "gpu":     {"unrecoverable": False, "reason": ""},
+        "backends_healthy": f"{n_healthy}/{len(COMFYUI_BACKENDS)}",
+        "gpu":      {"unrecoverable": aggregate_gpu["unrecoverable"], "reason": aggregate_gpu["reason"]},
+        "backends": backends_detail,
     }
 
-    # GPU latch — if the generation worker recorded a non-OOM CUDA
-    # fault, that's the most informative signal and we surface it
-    # first.
-    gpu = get_gpu_state()
-    health_response["gpu"]["unrecoverable"] = gpu["unrecoverable"]
-    health_response["gpu"]["reason"] = gpu["reason"]
-    if gpu["unrecoverable"]:
-        health_response["status"] = "unhealthy"
-        response.status_code = 503
-
-    # ComfyUI HTTP probe — /system_stats also lets us return the
-    # raw stats blob alongside, useful for debugging.
-    try:
-        timeout = aiohttp.ClientTimeout(total=5)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(COMFYUI_API_SYSTEM_STATS) as stats_response:
-                if stats_response.status == 200:
-                    health_response["comfyui"]["http_ok"] = True
-                    health_response["comfyui"]["system_stats"] = await stats_response.json()
-                else:
-                    health_response["comfyui"]["http_error"] = (
-                        f"system_stats returned {stats_response.status}"
-                    )
-    except aiohttp.ClientError as e:
-        health_response["comfyui"]["http_error"] = f"connect failed: {e}"
-    except Exception as e:
-        health_response["comfyui"]["http_error"] = f"unexpected: {e}"
-
-    # ComfyUI WebSocket probe — covers the case where HTTP is up
-    # but the WS server is wedged (we've observed this once where
-    # the python process had hung the asyncio loop).
-    try:
-        timeout = aiohttp.ClientTimeout(total=2.0)
-        ws_url = COMFYUI_API_SYSTEM_STATS.split("/system_stats")[0].replace("http", "ws", 1) + "/ws"
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.ws_connect(ws_url, params={"clientId": "healthcheck"}) as ws:
-                health_response["comfyui"]["websocket_ok"] = True
-                await ws.close()
-    except Exception as e:
-        health_response["comfyui"]["websocket_error"] = f"{e}"
-
-    if not (health_response["comfyui"]["http_ok"] and health_response["comfyui"]["websocket_ok"]):
-        health_response["status"] = "unhealthy"
+    if health_response["status"] != "healthy":
         response.status_code = 503
 
     return health_response

@@ -10,19 +10,71 @@ except ImportError:
     # dotenv not installed, continue without it
     pass
 
-# Base API configuration
+# Base API configuration.
+#
+# Multi-backend support. The wrapper can fan out across N ComfyUI
+# processes for parallelism — typically 1 per GPU on a multi-GPU
+# host, occasionally 2+ per GPU when the model fits multiple times
+# in VRAM. Set `COMFYUI_BACKENDS` to a comma-separated list of base
+# URLs:
+#
+#     COMFYUI_BACKENDS="http://127.0.0.1:8188,http://127.0.0.1:8189"
+#
+# When unset, falls back to single-backend behaviour using
+# `COMFYUI_API_BASE` (default `http://127.0.0.1:8188`). Existing
+# deployments need no changes.
 COMFYUI_API_BASE = os.getenv('COMFYUI_API_BASE', 'http://127.0.0.1:8188')
 
-# API endpoints
-COMFYUI_API_PROMPT = urljoin(COMFYUI_API_BASE, '/prompt')
-COMFYUI_API_QUEUE = urljoin(COMFYUI_API_BASE, '/queue')
-COMFYUI_API_HISTORY = urljoin(COMFYUI_API_BASE, '/history')
-COMFYUI_API_INTERRUPT = urljoin(COMFYUI_API_BASE, '/api/interrupt')
-COMFYUI_API_FREE = urljoin(COMFYUI_API_BASE, '/free')
-COMFYUI_API_SYSTEM_STATS = urljoin(COMFYUI_API_BASE, '/system_stats')
 
-# WebSocket endpoint (convert http to ws, https to wss)
-COMFYUI_API_WEBSOCKET = COMFYUI_API_BASE.replace('http://', 'ws://').replace('https://', 'wss://') + '/ws'
+def _parse_backends(raw, fallback: str) -> list:
+    """Comma-separated URL list → cleaned [base_url, ...]; fallback
+    when empty. Trailing slashes stripped so urljoin behaves the
+    same regardless of how the operator wrote the URL."""
+    if not raw:
+        return [fallback.rstrip('/')]
+    out = []
+    for part in raw.split(','):
+        url = part.strip().rstrip('/')
+        if url and url not in out:
+            out.append(url)
+    return out or [fallback.rstrip('/')]
+
+
+COMFYUI_BACKENDS = _parse_backends(os.getenv('COMFYUI_BACKENDS'), COMFYUI_API_BASE)
+
+
+def comfyui_urls(base: str) -> dict:
+    """Build the full set of ComfyUI endpoint URLs for a given
+    backend's HTTP base. Used by GenerationWorker per-instance and
+    by /health to walk every backend.
+
+    `prompt`, `queue`, `history`, `interrupt`, `free`, `system_stats`
+    are HTTP; `websocket` is ws://-prefixed.
+    """
+    base = base.rstrip('/')
+    return {
+        "base":         base,
+        "prompt":       urljoin(base + '/', 'prompt'),
+        "queue":        urljoin(base + '/', 'queue'),
+        "history":      urljoin(base + '/', 'history'),
+        "interrupt":    urljoin(base + '/', 'api/interrupt'),
+        "free":         urljoin(base + '/', 'free'),
+        "system_stats": urljoin(base + '/', 'system_stats'),
+        "websocket":    base.replace('http://', 'ws://').replace('https://', 'wss://') + '/ws',
+    }
+
+
+# Back-compat module-level constants — point at the FIRST backend.
+# New code reads URLs through `comfyui_urls(backend)` so it works
+# against any of N backends.
+_FIRST_BACKEND = comfyui_urls(COMFYUI_BACKENDS[0])
+COMFYUI_API_PROMPT       = _FIRST_BACKEND["prompt"]
+COMFYUI_API_QUEUE        = _FIRST_BACKEND["queue"]
+COMFYUI_API_HISTORY      = _FIRST_BACKEND["history"]
+COMFYUI_API_INTERRUPT    = _FIRST_BACKEND["interrupt"]
+COMFYUI_API_FREE         = _FIRST_BACKEND["free"]
+COMFYUI_API_SYSTEM_STATS = _FIRST_BACKEND["system_stats"]
+COMFYUI_API_WEBSOCKET    = _FIRST_BACKEND["websocket"]
 
 # WebSocket timeouts. Tuneable via env so an operator can stretch
 # them for unusually long workflows without a code change.

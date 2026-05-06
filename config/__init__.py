@@ -5,6 +5,8 @@ Configuration module for ComfyUI API wrapper
 from .config import (
     # ComfyUI API Configuration
     COMFYUI_API_BASE,
+    COMFYUI_BACKENDS,
+    comfyui_urls,
     COMFYUI_API_PROMPT,
     COMFYUI_API_QUEUE,
     COMFYUI_API_HISTORY,
@@ -46,6 +48,8 @@ from .config import (
 
 __all__ = [
     'COMFYUI_API_BASE',
+    'COMFYUI_BACKENDS',
+    'comfyui_urls',
     'COMFYUI_API_PROMPT',
     'COMFYUI_API_QUEUE',
     'COMFYUI_API_HISTORY',
