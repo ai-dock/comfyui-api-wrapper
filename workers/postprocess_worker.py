@@ -182,7 +182,7 @@ class PostprocessWorker:
                 # picking up stale references.
                 output_types_to_process = []
                 if 'files' in node_outputs:
-                    logger.info(f"Node {node_id}: using 'files' (this job's outputs); skipping 'images' to avoid stale refs")
+                    logger.debug(f"Node {node_id}: using 'files' (this job's outputs); skipping 'images' to avoid stale refs")
                     output_types_to_process.append('files')
                     for key in node_outputs.keys():
                         if key not in ('images', 'files'):
@@ -287,7 +287,7 @@ class PostprocessWorker:
             except Exception:
                 pass  # not under OUTPUT_DIR — let the original path through
 
-            logger.info(f"Copying {real_original_path} to {dest_path}")
+            logger.debug(f"Copying {real_original_path} to {dest_path}")
             
             # Copy the file (using real path to handle symlinks)
             await self._copy_file_async(real_original_path, dest_path)

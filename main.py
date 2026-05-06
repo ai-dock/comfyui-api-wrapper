@@ -1,4 +1,5 @@
 import asyncio
+import os
 import uuid
 import logging
 import json
@@ -64,10 +65,39 @@ else:
     request_store = SimpleMemoryCache(namespace="request_store", ttl=CACHE_TTL)
     response_store = SimpleMemoryCache(namespace="response_store", ttl=CACHE_TTL)
 
-# Processing queues (defined outside cache logic)
-preprocess_queue = asyncio.Queue()    
+# Processing queues. preprocess is bounded so the wrapper can shed
+# load with 503 + Retry-After when saturated rather than silently
+# stacking work that may never drain. generation/postprocess are
+# unbounded — work flows from preprocess through these in fixed
+# steps, so they can't grow beyond what preprocess admits.
+_MAX_QUEUE_SIZE = WORKER_CONFIG["max_queue_size"]
+preprocess_queue = asyncio.Queue(maxsize=_MAX_QUEUE_SIZE)
 generation_queue = asyncio.Queue()
 postprocess_queue = asyncio.Queue()
+
+
+# Slim Result envelopes by default — the customer can opt back into
+# the full ComfyUI history blob via env var or per-request header.
+# Saves ~5KB per response in the common case.
+_INCLUDE_COMFYUI_RESPONSE_DEFAULT = os.getenv("INCLUDE_COMFYUI_RESPONSE", "false").lower() == "true"
+
+
+def _shape_result(result, request: "Request | None" = None):
+    """Return a copy of `result` with `comfyui_response` stripped to
+    `{}` unless the caller opted in.
+
+    Per-request override: header `X-Include-ComfyUI-Response: 1`.
+    Global default: env `INCLUDE_COMFYUI_RESPONSE=true`.
+    """
+    include = _INCLUDE_COMFYUI_RESPONSE_DEFAULT
+    if request is not None:
+        hdr = request.headers.get("x-include-comfyui-response")
+        if hdr is not None:
+            include = hdr.strip().lower() in ("1", "true", "yes", "on")
+    if include:
+        return result
+    # Pydantic copy-with-update — leaves the original untouched.
+    return result.model_copy(update={"comfyui_response": {}})
 
 
 @app.on_event("startup")
@@ -316,6 +346,7 @@ def markdown_to_html(markdown_text: str) -> str:
 # ===== ASYNC ENDPOINT (renamed from /payload) =====
 @app.post('/generate', response_model=Result)
 async def generate(
+    request: Request,
     response: Response,
     payload: Annotated[
         Payload,
@@ -328,18 +359,35 @@ async def generate(
     if not payload.input.request_id:
         payload.input.request_id = str(uuid.uuid4())
     request_id = payload.input.request_id
-    
+
+    # Backpressure: if the preprocess queue is full, the wrapper is
+    # already at capacity. Shed load with 503 so the caller can
+    # retry / route to another pod, rather than queue work that
+    # may never drain.
+    try:
+        preprocess_queue.put_nowait(request_id)
+    except asyncio.QueueFull:
+        logger.warning(
+            f"Rejecting {request_id}: preprocess queue full ({preprocess_queue.qsize()}/{_MAX_QUEUE_SIZE})"
+        )
+        response.status_code = 503
+        response.headers["Retry-After"] = "5"
+        return Result(
+            id=request_id,
+            status="failed",
+            message=f"Worker at capacity ({_MAX_QUEUE_SIZE} in flight); retry shortly",
+        )
+
     result_pending = Result(id=request_id)
 
     try:
         # Store request and initial result
         await request_store.set(request_id, payload)
         await response_store.set(request_id, result_pending)
-        await preprocess_queue.put(request_id)
-        
+
         logger.info(f"Queued request {request_id}")
         response.status_code = 202
-        return result_pending
+        return _shape_result(result_pending, request)
     except Exception as e:
         logger.error(f"Failed to queue request {request_id}: {e}")
         response.status_code = 500  # Internal Server Error
@@ -348,7 +396,7 @@ async def generate(
             status="failed",
             message=f"Failed to queue request: {str(e)}"
         )
-        return failed_result
+        return _shape_result(failed_result, request)
 
 # ===== SYNCHRONOUS ENDPOINT =====
 @asynccontextmanager
@@ -390,10 +438,24 @@ async def generate_sync(
         payload.input.request_id = str(uuid.uuid4())
     request_id = payload.input.request_id
 
+    # Backpressure (see /generate for rationale).
+    try:
+        preprocess_queue.put_nowait(request_id)
+    except asyncio.QueueFull:
+        logger.warning(
+            f"Rejecting {request_id}: preprocess queue full ({preprocess_queue.qsize()}/{_MAX_QUEUE_SIZE})"
+        )
+        response.status_code = 503
+        response.headers["Retry-After"] = "5"
+        return Result(
+            id=request_id,
+            status="failed",
+            message=f"Worker at capacity ({_MAX_QUEUE_SIZE} in flight); retry shortly",
+        )
+
     result_pending = Result(id=request_id)
     await request_store.set(request_id, payload)
     await response_store.set(request_id, result_pending)
-    await preprocess_queue.put(request_id)
 
     logger.info(f"Queued synchronous request {request_id}")
 
@@ -402,7 +464,7 @@ async def generate_sync(
             while True:
                 result = await response_store.get(request_id)
                 if result and result.status in ["completed", "failed", "timeout", "cancelled"]:
-                    return result
+                    return _shape_result(result, request)
                 await asyncio.sleep(0.5)
 
     except asyncio.CancelledError:
@@ -433,12 +495,27 @@ async def generate_stream(
     
     result_pending = Result(id=request_id)
 
+    # Backpressure (see /generate for rationale). Stream variant
+    # raises HTTPException so FastAPI emits a JSON 503 instead of
+    # opening an SSE stream that immediately closes.
+    try:
+        preprocess_queue.put_nowait(request_id)
+    except asyncio.QueueFull:
+        from fastapi import HTTPException
+        logger.warning(
+            f"Rejecting {request_id}: preprocess queue full ({preprocess_queue.qsize()}/{_MAX_QUEUE_SIZE})"
+        )
+        raise HTTPException(
+            status_code=503,
+            detail=f"Worker at capacity ({_MAX_QUEUE_SIZE} in flight); retry shortly",
+            headers={"Retry-After": "5"},
+        )
+
     try:
         # Store request and initial result
         await request_store.set(request_id, payload)
         await response_store.set(request_id, result_pending)
-        await preprocess_queue.put(request_id)
-        
+
         logger.info(f"Starting stream for request {request_id}")
         
         # Return streaming response
@@ -660,20 +737,20 @@ def _serialize_result(result) -> dict:
 
 
 @app.get('/result/{request_id}', response_model=Result, status_code=200)
-async def result(request_id: str, response: Response):
+async def result(request_id: str, request: Request, response: Response):
     """Get the result of a processing request"""
     try:
         result = await response_store.get(request_id)
         if not result:
             result = Result(id=request_id, status="failed", message="Request ID not found")
             response.status_code = 404
-        
-        return result
+
+        return _shape_result(result, request)
     except Exception as e:
         logger.error(f"Failed to get result for {request_id}: {e}")
         result = Result(id=request_id, status="failed", message="Internal server error")
         response.status_code = 500
-        return result
+        return _shape_result(result, request)
 
 @app.post('/cancel/{request_id}', status_code=200)
 async def cancel_request_simple(

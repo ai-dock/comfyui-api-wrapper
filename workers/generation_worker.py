@@ -614,7 +614,7 @@ class GenerationWorker:
                                 if data.get("data", {}).get("prompt_id") == comfyui_job_id:
 
                                     if message_type == "execution_start":
-                                        logger.info(f"Execution started for {comfyui_job_id}")
+                                        logger.debug(f"Execution started for {comfyui_job_id}")
                                         await self._update_progress(
                                             request_id,
                                             "Execution started..."
@@ -622,13 +622,13 @@ class GenerationWorker:
 
                                     elif message_type == "execution_cached":
                                         nodes = data.get("data", {}).get("nodes", [])
-                                        logger.info(f"Using cached results for nodes: {nodes}")
+                                        logger.debug(f"Using cached results for nodes: {nodes}")
                                         execution_result["nodes_executed"].extend(nodes)
 
                                     elif message_type == "executing":
                                         node = data.get("data", {}).get("node")
                                         if node:
-                                            logger.info(f"Executing node: {node}")
+                                            logger.debug(f"Executing node: {node}")
                                             execution_result["nodes_executed"].append(node)
                                             await self._update_progress(
                                                 request_id,
@@ -646,7 +646,7 @@ class GenerationWorker:
                                         max_value = progress_data.get("max", 100)
                                         progress_pct = (value / max_value * 100) if max_value > 0 else 0
                                         progress_msg = f"Progress: {progress_pct:.1f}% ({value}/{max_value})"
-                                        logger.info(f"Progress update: {progress_msg}")
+                                        logger.debug(f"Progress update: {progress_msg}")
                                         execution_result["progress_updates"].append({
                                             "time": asyncio.get_event_loop().time() - start_time,
                                             "value": value,
@@ -668,7 +668,7 @@ class GenerationWorker:
                                     elif message_type == "executed":
                                         node = data.get("data", {}).get("node")
                                         output = data.get("data", {}).get("output")
-                                        logger.info(f"Node {node} executed successfully")
+                                        logger.debug(f"Node {node} executed successfully")
                                         logger.debug(f"Node output: {json.dumps(output, indent=2)[:500]}...")
 
                             except json.JSONDecodeError as e:
