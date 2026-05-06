@@ -724,7 +724,21 @@ async def queue_info():
 
 @app.get('/health', response_model=dict)
 async def health(response: Response):
-    """Health check endpoint - returns healthy only if ComfyUI system stats is accessible"""
+    """Health check endpoint.
+
+    Returns 200 + {"status": "healthy", ...} only when:
+      * ComfyUI's HTTP /system_stats responds 200
+      * ComfyUI's WebSocket accepts a connect probe
+      * No CUDA-unrecoverable fault has been latched by the
+        generation worker (illegal memory access, device-side
+        assert, etc.)
+
+    Returns 503 + {"status": "unhealthy", ...} otherwise. An
+    external health monitor / orchestrator polling this endpoint
+    can replace the pod on a clean host when it goes unhealthy.
+    """
+    from workers.generation_worker import get_gpu_state
+
     health_response = {
         "status": "healthy",
         "cache_type": CACHE_TYPE,
@@ -732,26 +746,54 @@ async def health(response: Response):
             "preprocess": preprocess_queue.qsize(),
             "generation": generation_queue.qsize(),
             "postprocess": postprocess_queue.qsize(),
-        }
+        },
+        "comfyui": {"http_ok": False, "websocket_ok": False},
+        "gpu":     {"unrecoverable": False, "reason": ""},
     }
 
+    # GPU latch — if the generation worker recorded a non-OOM CUDA
+    # fault, that's the most informative signal and we surface it
+    # first.
+    gpu = get_gpu_state()
+    health_response["gpu"]["unrecoverable"] = gpu["unrecoverable"]
+    health_response["gpu"]["reason"] = gpu["reason"]
+    if gpu["unrecoverable"]:
+        health_response["status"] = "unhealthy"
+        response.status_code = 503
+
+    # ComfyUI HTTP probe — /system_stats also lets us return the
+    # raw stats blob alongside, useful for debugging.
     try:
         timeout = aiohttp.ClientTimeout(total=5)
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.get(COMFYUI_API_SYSTEM_STATS) as stats_response:
-                if stats_response.status != 200:
-                    health_response["status"] = "unhealthy"
-                    health_response["comfyui_error"] = f"System stats returned status {stats_response.status}"
-                    response.status_code = 502
+                if stats_response.status == 200:
+                    health_response["comfyui"]["http_ok"] = True
+                    health_response["comfyui"]["system_stats"] = await stats_response.json()
                 else:
-                    health_response["comfyui_system_stats"] = await stats_response.json()
+                    health_response["comfyui"]["http_error"] = (
+                        f"system_stats returned {stats_response.status}"
+                    )
     except aiohttp.ClientError as e:
-        health_response["status"] = "unhealthy"
-        health_response["comfyui_error"] = f"Failed to connect to ComfyUI: {str(e)}"
-        response.status_code = 502
+        health_response["comfyui"]["http_error"] = f"connect failed: {e}"
     except Exception as e:
+        health_response["comfyui"]["http_error"] = f"unexpected: {e}"
+
+    # ComfyUI WebSocket probe — covers the case where HTTP is up
+    # but the WS server is wedged (we've observed this once where
+    # the python process had hung the asyncio loop).
+    try:
+        timeout = aiohttp.ClientTimeout(total=2.0)
+        ws_url = COMFYUI_API_SYSTEM_STATS.split("/system_stats")[0].replace("http", "ws", 1) + "/ws"
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.ws_connect(ws_url, params={"clientId": "healthcheck"}) as ws:
+                health_response["comfyui"]["websocket_ok"] = True
+                await ws.close()
+    except Exception as e:
+        health_response["comfyui"]["websocket_error"] = f"{e}"
+
+    if not (health_response["comfyui"]["http_ok"] and health_response["comfyui"]["websocket_ok"]):
         health_response["status"] = "unhealthy"
-        health_response["comfyui_error"] = f"Unexpected error: {str(e)}"
-        response.status_code = 502
+        response.status_code = 503
 
     return health_response

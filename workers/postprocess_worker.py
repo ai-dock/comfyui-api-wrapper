@@ -175,13 +175,35 @@ class PostprocessWorker:
                 
                 logger.debug(f"Processing node {node_id} outputs: {list(node_outputs.keys())}")
                 
-                # Look for different output types (images, gifs, videos, etc.)
-                for output_type, output_list in node_outputs.items():
+                # When a node emits both 'files' and 'images', the 'files'
+                # array references THIS job's actual outputs while 'images'
+                # may carry stale entries from a cached prior execution.
+                # Prefer 'files' and skip 'images' to avoid duplicates /
+                # picking up stale references.
+                output_types_to_process = []
+                if 'files' in node_outputs:
+                    logger.info(f"Node {node_id}: using 'files' (this job's outputs); skipping 'images' to avoid stale refs")
+                    output_types_to_process.append('files')
+                    for key in node_outputs.keys():
+                        if key not in ('images', 'files'):
+                            output_types_to_process.append(key)
+                else:
+                    output_types_to_process = list(node_outputs.keys())
+
+                # Look for different output types (images, gifs, videos, files, etc.)
+                for output_type in output_types_to_process:
+                    output_list = node_outputs.get(output_type)
                     if not isinstance(output_list, list):
                         logger.debug(f"Skipping non-list output type {output_type} in node {node_id}")
                         continue
-                    
+
                     for item in output_list:
+                        # Some node types report files as plain string paths.
+                        # Coerce to the dict shape the rest of postprocess
+                        # expects.
+                        if isinstance(item, str):
+                            item = {"filename": Path(item).name, "subfolder": "", "type": "output"}
+
                         if isinstance(item, dict) and 'filename' in item:
                             # Skip preview/temp files
                             file_type = item.get('type', '')
@@ -242,10 +264,29 @@ class PostprocessWorker:
             
             # Destination path in job directory
             dest_path = job_output_dir / filename
-            
+
             # Get the real path (in case original_path is a symlink from a cached result)
             real_original_path = original_path.resolve()
-            
+
+            # Defensive: when ComfyUI's history points at a path that
+            # has been symlinked from a previous job's directory, we'd
+            # otherwise copy that prior job's file as if it were ours.
+            # Only accept sources that are top-level under OUTPUT_DIR
+            # OR that live under a subdirectory whose first segment is
+            # this request_id.
+            try:
+                rel = real_original_path.relative_to(self.output_dir)
+                rel_parts = rel.parts
+                if len(rel_parts) == 1:
+                    pass
+                elif rel_parts[0] == str(request_id):
+                    pass
+                else:
+                    logger.debug(f"Skipping source from different request directory: {real_original_path}")
+                    return None
+            except Exception:
+                pass  # not under OUTPUT_DIR — let the original path through
+
             logger.info(f"Copying {real_original_path} to {dest_path}")
             
             # Copy the file (using real path to handle symlinks)
