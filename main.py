@@ -474,7 +474,7 @@ async def generate_sync(
         async with cancel_on_disconnect(request, request_id):
             while True:
                 result = await response_store.get(request_id)
-                if result and result.status in ["completed", "failed", "timeout", "cancelled"]:
+                if result and result.status in ("completed", "failed", "cancelled"):
                     return _shape_result(result, request)
                 await asyncio.sleep(0.5)
 
@@ -553,7 +553,7 @@ async def _mark_request_cancelled(request_id: str):
         result = await response_store.get(request_id)
         if result:
             # Only update if not already in a terminal state
-            if result.status not in ['completed', 'failed', 'timeout', 'cancelled']:
+            if result.status not in ("completed", "failed", "cancelled"):
                 result.status = "cancelled"
                 result.message = "Request cancelled due to client disconnection"
                 await response_store.set(request_id, result)
@@ -620,9 +620,11 @@ async def _stream_status_updates(request_id: str):
                 last_result = current_result
                 last_queue_position = queue_position
             
-            # Check if processing is complete
+            # Check if processing is complete. `cancelled` is a
+            # terminal state too — without it here the stream
+            # would hang indefinitely on a cancelled job.
             if current_result and hasattr(current_result, 'status'):
-                if current_result.status in ['completed', 'failed', 'timeout']:
+                if current_result.status in ('completed', 'failed', 'cancelled'):
                     # Send final result
                     final_data = {
                         "request_id": request_id,
@@ -778,7 +780,7 @@ async def cancel_request_simple(
             return {"error": f"Request {request_id} not found"}
         
         # Check if already in a terminal state
-        if result.status in ['completed', 'failed', 'timeout', 'cancelled']:
+        if result.status in ("completed", "failed", "cancelled"):
             return {
                 "message": f"Request {request_id} is already {result.status}",
                 "status": result.status
