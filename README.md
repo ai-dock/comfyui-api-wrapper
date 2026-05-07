@@ -96,11 +96,20 @@ configuration. Most defaults are sensible.
       "region":            "us-east-1"
     },
 
-    // Optional: per-request webhook override.
+    // Optional: per-request webhook override. `secret` enables
+    // HMAC-SHA256 signing for this request (overrides
+    // `WEBHOOK_SECRET` env default).
     "webhook": {
       "url":          "https://your-endpoint.example.com",
-      "extra_params": {"any": "context"}
-    }
+      "extra_params": {"any": "context"},
+      "secret":       "shared-secret-for-signing",
+      "timeout":      30
+    },
+
+    // Optional: inline outputs as base64 in the Result envelope.
+    // See § Inline base64 output. Default false. The header
+    // `X-Return-Outputs-As-Base64: 1` flips this server-side.
+    "return_outputs_as_base64": false
   }
 }
 ```
@@ -121,7 +130,7 @@ async completion), and as the `result` payload of the final
 {
   "id":      "request-uuid",
   "message": "Processing complete.",
-  "status":  "queued|processing|generating|generated|completed|failed|timeout|cancelled",
+  "status":  "pending|processing|generating|generated|completed|failed|cancelled",
   "comfyui_response": { /* ComfyUI's /history/{prompt_id} payload, slim by default — see INCLUDE_COMFYUI_RESPONSE */ },
   "output":  [
     {
@@ -132,7 +141,10 @@ async completion), and as the `result` payload of the final
       "node_id":     "9",
       "output_type": "images",
       "url":         "https://your-bucket.../ComfyUI_00001_.png",   // only when S3 upload succeeded
-      "upload_error": "..."                                          // only on upload failure
+      "upload_error": "...",                                         // only on S3 upload failure
+      "data":        "iVBORw0KGgoAAAA...",                           // only when base64 inlining was opted in
+      "mimetype":    "image/png",                                    // accompanies `data`
+      "error":       "..."                                            // only when base64 inlining failed (e.g. file too large)
     }
   ],
   "timings": {
