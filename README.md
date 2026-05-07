@@ -745,20 +745,27 @@ modifier-mode submissions go through this pass.
 
 ## Error handling
 
+The HTTP status code on `/generate/sync` and `/result/{id}`
+mirrors the terminal `Result.status` so callers that key off
+the HTTP code (the daemon's sync forwarder, benchmark drivers,
+default `requests`/`fetch` happy-path checks) can't misread a
+fast failure as a fast success.
+
 | HTTP | When |
 |---|---|
-| `200` | Sync result delivered, or `/result/{id}` lookup succeeded. |
+| `200` | Result is `completed`, OR `/result/{id}` lookup returned a non-terminal in-progress state (so polling callers can distinguish "still working" from "done with status X"). |
 | `202` | Async submit accepted (returns the request id). |
 | `400` | Invalid JSON / Pydantic validation failure. |
 | `404` | `/result/{id}` or `/cancel/{id}` for an unknown id. |
-| `499` | `/generate/sync` only — client closed the connection. The job is marked `cancelled`. |
-| `500` | Unexpected wrapper error. |
-| `503` | Inbound queue saturated (`Retry-After: 5`), or `/health` failed (one or more backends down / GPU latched). |
+| `499` | `/generate/sync` cancel-on-disconnect path, OR a terminal `Result.status: "cancelled"` returned to a polling caller. |
+| `500` | Result is `failed` and `message` doesn't match an upstream-connectivity pattern — generation-side error (bad workflow, OOM, etc.). Also: any unexpected wrapper internal error. |
+| `502` | Result is `failed` and `message` matches an upstream-connectivity / timeout pattern (`cannot connect`, `failed to post workflow after`, `connection refused`, `websocket timeout`, `timed out`, etc.) — ComfyUI was unreachable or stopped responding. |
+| `503` | Inbound queue saturated (`Retry-After: 5`), OR `/health` failed (one or more backends down / GPU latched). |
 
-A Result envelope with `status: "failed"` is **not** an HTTP
-error — the request was processed, the workflow execution
-failed. Inspect `message` and `comfyui_response.<id>.status`
-for the engine-side reason.
+The full Result envelope (with `status`, `message`,
+`comfyui_response`, etc.) ships in the body regardless of HTTP
+code. Inspect `message` and `comfyui_response.<id>.status` for
+the full engine-side reason on a 4xx/5xx.
 
 ## Architecture
 
