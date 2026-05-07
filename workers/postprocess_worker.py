@@ -3,25 +3,9 @@ import asyncio
 import logging
 import os  # Still needed for symlink and remove operations
 import shutil
-import uuid
 from pathlib import Path
 from typing import Dict, List, Optional
 import json
-
-
-def _looks_like_request_id(name: str) -> bool:
-    """Return True if ``name`` matches the UUID format used for request IDs.
-
-    Used by the stale-cache guard in ``_process_output_file`` to decide
-    whether a non-self path component is "another request's directory"
-    (UUID-shaped — refuse) vs. a workflow-author subfolder convention
-    such as ``video/`` or ``images/`` (not UUID-shaped — accept).
-    """
-    try:
-        uuid.UUID(str(name))
-        return True
-    except (ValueError, AttributeError, TypeError):
-        return False
 
 import aiobotocore.session
 import aiofiles
@@ -326,31 +310,19 @@ class PostprocessWorker:
             # Destination path in job directory
             dest_path = job_output_dir / filename
 
-            # Get the real path (in case original_path is a symlink from a cached result)
+            # Get the real path (in case original_path is a symlink from a cached result).
+            #
+            # No "is this the right request's directory?" guard here.
+            # ComfyUI's history is the source of truth for which file
+            # belongs to this job, and a cache hit on the same prompt
+            # legitimately resolves into the *prior* request's
+            # per-request directory (that's where postprocess copied
+            # the file last time). Rejecting that path silently drops
+            # the output. We trust ComfyUI's mapping, copy whatever it
+            # points at into the current request's directory, and let
+            # the same-file shortcut below handle the unusual case
+            # where source and destination are already the same file.
             real_original_path = original_path.resolve()
-
-            # Defensive: when ComfyUI's history points at a path that
-            # has been symlinked from a previous job's directory, we'd
-            # otherwise copy that prior job's file as if it were ours.
-            # Reject only when the first path segment is a UUID-shaped
-            # request id that isn't ours — that's the actual stale-cache
-            # case. Non-UUID subfolders (workflow filename_prefix
-            # conventions like ``video/`` or ``images/``) are allowed
-            # through; rejecting them silently dropped legitimate
-            # outputs of any workflow that organised files into named
-            # subfolders.
-            try:
-                rel = real_original_path.relative_to(self.output_dir)
-                rel_parts = rel.parts
-                if (
-                    len(rel_parts) > 1
-                    and _looks_like_request_id(rel_parts[0])
-                    and rel_parts[0] != str(request_id)
-                ):
-                    logger.debug(f"Skipping source from different request directory: {real_original_path}")
-                    return None
-            except Exception:
-                pass  # not under OUTPUT_DIR — let the original path through
 
             # Same-file shortcut. When a request_id is reused AND
             # ComfyUI's prompt cache hits with the same outputs,
