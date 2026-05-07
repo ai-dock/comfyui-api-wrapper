@@ -1,16 +1,24 @@
-"""Regression test: postprocess must accept outputs under a workflow-author
-subfolder (e.g. ``video/foo.mp4`` from ``filename_prefix: "video/foo"``).
+"""Regression tests for postprocess output discovery.
 
-Earlier the defensive stale-cache guard rejected *any* path whose first
-segment under ``OUTPUT_DIR`` wasn't either top-level or the current
-request id. That silently dropped legitimate outputs of workflows that
-organise files into named subfolders, with the surface symptom
-``Processed 0 output files for <request_id>`` despite the file being
-present on disk.
+Two failure modes both surface as ``Processed 0 output files for
+<request_id>`` despite the file being on disk:
 
-The fix narrows the guard so it only rejects UUID-shaped subdirectories
-that don't match the current request id (the real stale-cache case),
-and leaves arbitrary workflow-author subfolders alone.
+1. Workflow-author subfolders (``SaveVideo`` with ``filename_prefix:
+   "video/foo"`` writes to ``output/video/foo.mp4``) used to be
+   silently dropped because an over-eager defensive guard refused
+   anything outside the top-level or the current request's
+   per-request directory.
+
+2. Cache hits on a previously-seen prompt resolve into the *prior*
+   request's per-request directory (that's where postprocess copied
+   the file on the original run, and the top-level symlink still
+   points there). The same defensive guard refused those too.
+
+Both were the same broken assumption: "anything not under the current
+request's directory is stale". In reality the stale-cache concern
+doesn't exist — ComfyUI's history is the source of truth for which
+file belongs to this job, and we should copy whatever it points at
+into our per-request directory.
 """
 import os
 import uuid
@@ -76,11 +84,19 @@ async def test_workflow_subfolder_is_processed(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_other_request_subdir_still_rejected(tmp_path):
-    """The stale-cache guard the original check was written to enforce.
-    ComfyUI returned a path whose resolved location is inside *another*
-    request's per-request directory — copying that file into ours would
-    plagiarise a prior job's output. This must still be refused.
+async def test_cache_hit_resolving_into_prior_request_subdir(tmp_path):
+    """Cache hit on the same prompt as a prior job: ComfyUI's history
+    reports the same filename, the top-level entry is a symlink into
+    the prior request's per-request directory (where the wrapper
+    parked the file on the original run), and the resolved real path
+    therefore lives under another UUID-shaped subdirectory.
+
+    This is **not** stale data — it's the same prompt's output, which
+    is the whole point of ComfyUI's prompt cache. The wrapper must
+    accept it and copy it into the current request's directory rather
+    than silently dropping it (which is what an earlier over-eager
+    "different request directory" guard did, surfacing as
+    ``Processed 0 output files`` for every cache hit beyond the first).
     """
     w = _make_worker(tmp_path)
 
@@ -88,13 +104,14 @@ async def test_other_request_subdir_still_rejected(tmp_path):
     other_id   = str(uuid.uuid4())
     assert current_id != other_id
 
+    # Prior run's per-request directory holds the actual file.
     other_dir = tmp_path / other_id
     other_dir.mkdir()
     real_file = other_dir / "img.png"
-    real_file.write_bytes(b"NOT MINE")
+    real_file.write_bytes(b"CACHED")
 
-    # ComfyUI's history reports the file at top-level; the wrapper
-    # symlinked it into the prior request's dir on that prior run.
+    # Top-level entry is a symlink into that directory — what
+    # postprocess wrote on the prior run.
     top_link = tmp_path / "img.png"
     os.symlink(str(real_file), str(top_link))
 
@@ -108,11 +125,13 @@ async def test_other_request_subdir_still_rejected(tmp_path):
         node_id="9", output_type="images",
     )
 
-    assert result is None, (
-        "must not copy files that resolve into another request's directory"
+    assert result is not None, (
+        "cache-hit output must not be dropped just because it resolves "
+        "into another request's per-request directory"
     )
-    # Per-request dir stays empty — we didn't accidentally claim the file.
-    assert list(job_dir.iterdir()) == []
+    assert result["filename"] == "img.png"
+    dest = job_dir / "img.png"
+    assert dest.exists() and dest.read_bytes() == b"CACHED"
 
 
 @pytest.mark.asyncio
