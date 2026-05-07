@@ -52,13 +52,22 @@ class WebHook(BaseModel):
     url: str = Field(default="")
     extra_params: Dict = Field(default_factory=dict)
     timeout: int = Field(default=30)
-    
+    # Optional shared secret for HMAC-SHA256 signing. When set,
+    # outgoing webhooks include `X-Webhook-Signature: sha256=<hex>`
+    # over the exact JSON body bytes the consumer receives. Per-
+    # request `secret` takes precedence over the global
+    # `WEBHOOK_SECRET` env. Empty string means "no signing for
+    # this request even if env-default is set" (allows opt-out
+    # for trusted internal callers).
+    secret: str = Field(default="")
+
     @staticmethod
     def get_defaults():
         return {
             "url": "",
             "extra_params": {},
-            "timeout": 30
+            "timeout": 30,
+            "secret": ""
         }
     
     def has_valid_url(self) -> bool:
@@ -82,6 +91,14 @@ class Input(BaseModel):
     workflow_json: Dict = Field(default_factory=dict)
     s3: Optional[S3Config] = Field(default=None)
     webhook: Optional[WebHook] = Field(default=None)
+    # Inline each generated output's bytes as base64 under
+    # `output[*].data` (with `mimetype`). Useful for local dev,
+    # small-image pipelines, and webhook consumers who otherwise
+    # would need a separate S3 fetch. Coexists with S3 — both `data`
+    # and `url` are populated when both are configured. Per-file
+    # size cap is `OUTPUT_BASE64_MAX_BYTES` (env, default 10 MB).
+    # Per-request override via header `X-Return-Outputs-As-Base64: 1`.
+    return_outputs_as_base64: bool = Field(default=False)
     
     @model_validator(mode='after')
     def validate_workflow_mode(self):

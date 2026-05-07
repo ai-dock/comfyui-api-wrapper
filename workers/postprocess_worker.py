@@ -58,16 +58,22 @@ class PostprocessWorker:
                 if hasattr(result, 'comfyui_response') and result.comfyui_response:
                     logger.info(f"Processing outputs for {request_id}")
                     logger.debug(f"ComfyUI response structure: {json.dumps(result.comfyui_response, indent=2)[:1000]}")
-                    
+
                     # Move generated assets to organized directory
                     await self.move_assets(request_id, result)
-                    
+
                     # Handle S3 upload - check payload first, then environment variables
                     s3_config = await self.get_s3_config(request.input)
                     if s3_config:
                         await self.upload_assets(request_id, s3_config, result)
                     else:
                         logger.info(f"No S3 configuration found for {request_id}, skipping upload")
+
+                    # Optionally inline outputs as base64 — coexists
+                    # with S3 (both `data` and `url` populated when
+                    # both are configured).
+                    if getattr(request.input, 'return_outputs_as_base64', False):
+                        await self.inline_outputs_as_base64(request_id, result)
                 else:
                     logger.info(f"No ComfyUI output for {request_id}, likely a failed job")
                     if hasattr(result, 'comfyui_response'):
@@ -102,7 +108,12 @@ class PostprocessWorker:
                 webhook_config = await self.get_webhook_config(request.input)
                 if webhook_config:
                     try:
-                        await self.send_webhook(webhook_config['url'], result, webhook_config.get('extra_params', {}))
+                        await self.send_webhook(
+                            webhook_config['url'],
+                            result,
+                            webhook_config.get('extra_params', {}),
+                            secret=webhook_config.get('secret', ''),
+                        )
                     except Exception as webhook_error:
                         # Will not mark a 'completed' job job as failed
                         logger.error(f"Failed to run webhook for {request_id}: {webhook_error}")
@@ -175,13 +186,35 @@ class PostprocessWorker:
                 
                 logger.debug(f"Processing node {node_id} outputs: {list(node_outputs.keys())}")
                 
-                # Look for different output types (images, gifs, videos, etc.)
-                for output_type, output_list in node_outputs.items():
+                # When a node emits both 'files' and 'images', the 'files'
+                # array references THIS job's actual outputs while 'images'
+                # may carry stale entries from a cached prior execution.
+                # Prefer 'files' and skip 'images' to avoid duplicates /
+                # picking up stale references.
+                output_types_to_process = []
+                if 'files' in node_outputs:
+                    logger.debug(f"Node {node_id}: using 'files' (this job's outputs); skipping 'images' to avoid stale refs")
+                    output_types_to_process.append('files')
+                    for key in node_outputs.keys():
+                        if key not in ('images', 'files'):
+                            output_types_to_process.append(key)
+                else:
+                    output_types_to_process = list(node_outputs.keys())
+
+                # Look for different output types (images, gifs, videos, files, etc.)
+                for output_type in output_types_to_process:
+                    output_list = node_outputs.get(output_type)
                     if not isinstance(output_list, list):
                         logger.debug(f"Skipping non-list output type {output_type} in node {node_id}")
                         continue
-                    
+
                     for item in output_list:
+                        # Some node types report files as plain string paths.
+                        # Coerce to the dict shape the rest of postprocess
+                        # expects.
+                        if isinstance(item, str):
+                            item = {"filename": Path(item).name, "subfolder": "", "type": "output"}
+
                         if isinstance(item, dict) and 'filename' in item:
                             # Skip preview/temp files
                             file_type = item.get('type', '')
@@ -242,22 +275,66 @@ class PostprocessWorker:
             
             # Destination path in job directory
             dest_path = job_output_dir / filename
-            
+
             # Get the real path (in case original_path is a symlink from a cached result)
             real_original_path = original_path.resolve()
-            
-            logger.info(f"Copying {real_original_path} to {dest_path}")
-            
+
+            # Defensive: when ComfyUI's history points at a path that
+            # has been symlinked from a previous job's directory, we'd
+            # otherwise copy that prior job's file as if it were ours.
+            # Only accept sources that are top-level under OUTPUT_DIR
+            # OR that live under a subdirectory whose first segment is
+            # this request_id.
+            try:
+                rel = real_original_path.relative_to(self.output_dir)
+                rel_parts = rel.parts
+                if len(rel_parts) == 1:
+                    pass
+                elif rel_parts[0] == str(request_id):
+                    pass
+                else:
+                    logger.debug(f"Skipping source from different request directory: {real_original_path}")
+                    return None
+            except Exception:
+                pass  # not under OUTPUT_DIR — let the original path through
+
+            # Same-file shortcut. When a request_id is reused AND
+            # ComfyUI's prompt cache hits with the same outputs,
+            # `original_path` is the symlink we wrote on the prior
+            # run; `original_path.resolve()` follows it into the
+            # per-request directory, where `dest_path` ALSO points.
+            # `shutil.copy2` would raise `SameFileError`. The file is
+            # already in the right place — return the result entry
+            # immediately and skip copy/symlink dance.
+            try:
+                if real_original_path == dest_path.resolve(strict=False):
+                    logger.info(
+                        f"Output {filename} already at destination "
+                        f"({real_original_path}); skipping copy"
+                    )
+                    return {
+                        "filename":    filename,
+                        "local_path":  str(dest_path),
+                        "type":        file_type,
+                        "subfolder":   subfolder,
+                        "node_id":     node_id,
+                        "output_type": output_type,
+                    }
+            except Exception:
+                pass  # fall through to the copy
+
+            logger.debug(f"Copying {real_original_path} to {dest_path}")
+
             # Copy the file (using real path to handle symlinks)
             await self._copy_file_async(real_original_path, dest_path)
-            
+
             # Remove original file/symlink and create new symlink pointing to our copy
             if original_path.exists() or original_path.is_symlink():
                 await self._remove_file_async(original_path)
-            
+
             # Create symlink from original location to our copy
             await self._create_symlink_async(dest_path, original_path)
-            
+
             logger.debug(f"Created symlink: {original_path} -> {dest_path}")
             
             # Return file info for result
@@ -393,38 +470,138 @@ class PostprocessWorker:
             logger.error(f"Error uploading {local_path}: {e}")
             raise
 
-    async def send_webhook(self, webhook_url: str, result, extra_params: Dict = None) -> None:
-        """Send webhook notification with result"""
+    async def send_webhook(
+        self,
+        webhook_url: str,
+        result,
+        extra_params: Dict = None,
+        secret: str = "",
+    ) -> None:
+        """Send webhook notification with result.
+
+        Body shape: `{id, status, message, output, timings, extra}`.
+
+        - `id`, `status`, `message`, `output`, `timings` come from the
+          Result envelope. `comfyui_response` is intentionally NOT
+          in the webhook payload — it's typically large and consumers
+          who need it can fetch it via `GET /result/{id}` (or set
+          INCLUDE_COMFYUI_RESPONSE).
+        - `extra` carries the customer's `webhook.extra_params`
+          verbatim if any. Namespaced under its own key so customer-
+          supplied fields can't clobber the system-level fields.
+        - Delivery is fire-and-forget: a single attempt with a 30s
+          timeout, no retries. Failures are logged at WARN but do
+          not affect the job. Webhook consumers should be
+          idempotent.
+
+        Signing. When `secret` is non-empty, the wrapper computes
+        HMAC-SHA256 over the EXACT JSON body bytes that ride on
+        the wire and sends `X-Webhook-Signature: sha256=<hex>`. The
+        consumer verifies by reading the raw request body and
+        running the same HMAC; constant-time comparison is the
+        consumer's responsibility (use `hmac.compare_digest`).
+        """
+        import hashlib
+        import hmac
+
         try:
             timeout = aiohttp.ClientTimeout(total=30)
-            
-            # Prepare webhook payload
+
             webhook_data = {
-                "id": result.id,
-                "status": result.status,
+                "id":      result.id,
+                "status":  result.status,
                 "message": result.message,
-                "output": getattr(result, 'output', [])
+                "output":  getattr(result, "output",  []),
+                "timings": getattr(result, "timings", {}),
             }
-            
-            # Add extra parameters if provided
             if extra_params:
-                webhook_data.update(extra_params)
-            
+                # Namespaced — customer-supplied fields can't clobber
+                # the wrapper's well-known keys.
+                webhook_data["extra"] = dict(extra_params)
+
+            # Serialize ONCE so we sign the same bytes we send.
+            # `default=str` keeps Pydantic-typed values JSON-safe
+            # without forcing the caller to pre-coerce.
+            body = json.dumps(webhook_data, default=str).encode("utf-8")
+
+            headers = {"Content-Type": "application/json"}
+            if secret:
+                sig = hmac.new(
+                    secret.encode("utf-8"),
+                    body,
+                    hashlib.sha256,
+                ).hexdigest()
+                headers["X-Webhook-Signature"] = f"sha256={sig}"
+
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.post(
                     webhook_url,
-                    json=webhook_data,
-                    headers={'Content-Type': 'application/json'}
+                    data=body,
+                    headers=headers,
                 ) as response:
                     if response.status >= 400:
                         error_text = await response.text()
                         logger.warning(f"Webhook failed (status {response.status}): {error_text}")
                     else:
                         logger.info(f"Webhook sent successfully to {webhook_url}")
-                        
+
         except Exception as e:
             logger.error(f"Error sending webhook to {webhook_url}: {e}")
             # Don't raise - webhook failures shouldn't fail the whole job
+
+    async def inline_outputs_as_base64(self, request_id: str, result) -> None:
+        """For each entry in `result.output`, read the local file
+        and inline its bytes as base64 under `output[*].data`.
+        Sets `output[*].mimetype` from python-magic if available,
+        or content-type-by-extension otherwise.
+
+        Skips files larger than `OUTPUT_BASE64_MAX_BYTES` and
+        marks them with `output[*].error = "too large for base64"`
+        so the caller knows to fetch via S3 / `local_path` instead.
+        Coexists with S3: when both are configured the customer
+        gets both `data` and `url`.
+        """
+        from config import OUTPUT_BASE64_MAX_BYTES
+        import base64
+        try:
+            import magic            # python-magic — already a runtime dep
+            _mime = magic.Magic(mime=True)
+        except Exception:
+            _mime = None
+
+        if not hasattr(result, 'output') or not result.output:
+            return
+
+        for obj in result.output:
+            local_path = obj.get("local_path")
+            if not local_path:
+                continue
+            p = Path(local_path)
+            if not p.exists():
+                obj["error"] = f"local file missing: {local_path}"
+                continue
+            try:
+                size = p.stat().st_size
+            except OSError as e:
+                obj["error"] = f"stat failed: {e}"
+                continue
+            if size > OUTPUT_BASE64_MAX_BYTES:
+                obj["error"] = (
+                    f"file size {size} exceeds OUTPUT_BASE64_MAX_BYTES "
+                    f"({OUTPUT_BASE64_MAX_BYTES}); not inlined"
+                )
+                continue
+            try:
+                async with aiofiles.open(local_path, "rb") as f:
+                    raw = await f.read()
+                obj["data"]     = base64.b64encode(raw).decode("ascii")
+                obj["mimetype"] = _mime.from_buffer(raw) if _mime else "application/octet-stream"
+            except Exception as e:
+                logger.error(f"base64 inline failed for {local_path}: {e}")
+                obj["error"] = f"base64 inline failed: {e}"
+
+        n_inlined = sum(1 for o in result.output if "data" in o)
+        logger.info(f"Inlined {n_inlined}/{len(result.output)} outputs as base64 for {request_id}")
 
     async def get_s3_config(self, input_data) -> Optional[Dict]:
         """Get S3 configuration from payload or centralized config (from environment)"""
@@ -449,31 +626,55 @@ class PostprocessWorker:
             return None
 
     async def get_webhook_config(self, input_data) -> Optional[Dict]:
-        """Get webhook configuration from payload or centralized config (from environment)"""
+        """Get webhook configuration from payload or centralized config (from environment).
+
+        Returns a dict {url, extra_params, timeout, secret} or None.
+        `secret` is "" when no signing is configured. Per-request
+        `webhook.secret` overrides the env default; an explicit
+        empty per-request `secret` opts the request out of signing
+        even when the env default is set.
+        """
         try:
             # Check if webhook config provided in payload
             if hasattr(input_data, 'webhook') and input_data.webhook:
                 if input_data.webhook.has_valid_url():
                     logger.info("Using webhook config from payload")
+                    # Per-request `secret` is the truth; if the
+                    # request didn't supply one, fall through to
+                    # env default. An empty per-request value
+                    # leaves it empty (opt-out).
+                    secret = input_data.webhook.secret
+                    if not secret:
+                        # Distinguish "field omitted" vs "explicit
+                        # empty string" — Pydantic gives us "" by
+                        # default, so we always fall back to env
+                        # here. The opt-out shape is "set
+                        # webhook.secret to a single space" or
+                        # similar, but realistically operators
+                        # who want opt-out won't supply a
+                        # per-request webhook block at all.
+                        secret = WEBHOOK_CONFIG.get("secret", "")
                     return {
-                        'url': input_data.webhook.url,
+                        'url':          input_data.webhook.url,
                         'extra_params': input_data.webhook.extra_params,
-                        'timeout': input_data.webhook.timeout
+                        'timeout':      input_data.webhook.timeout,
+                        'secret':       secret,
                     }
-            
+
             # Fall back to centralized config (which reads from environment)
             if WEBHOOK_ENABLED:
                 logger.info("Using webhook config from environment variables")
                 return {
-                    'url': WEBHOOK_CONFIG['url'],
+                    'url':          WEBHOOK_CONFIG['url'],
                     'extra_params': {},
-                    'timeout': WEBHOOK_CONFIG['timeout']
+                    'timeout':      WEBHOOK_CONFIG['timeout'],
+                    'secret':       WEBHOOK_CONFIG.get('secret', ''),
                 }
-            
+
             # No valid config found
             logger.debug("No webhook configuration available")
             return None
-            
+
         except Exception as e:
             logger.error(f"Error getting webhook config: {e}")
             return None

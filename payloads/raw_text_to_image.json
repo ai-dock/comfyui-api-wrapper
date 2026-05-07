@@ -4,108 +4,42 @@
     "workflow_json": {
       "3": {
         "inputs": {
-          "seed": 588445435278533,
+          "seed": "__RANDOM_INT__",
           "steps": 20,
           "cfg": 8,
           "sampler_name": "euler",
           "scheduler": "normal",
           "denoise": 1,
-          "model": [
-            "4",
-            0
-          ],
-          "positive": [
-            "6",
-            0
-          ],
-          "negative": [
-            "7",
-            0
-          ],
-          "latent_image": [
-            "5",
-            0
-          ]
+          "model": ["4", 0],
+          "positive": ["6", 0],
+          "negative": ["7", 0],
+          "latent_image": ["5", 0]
         },
-        "class_type": "KSampler",
-        "_meta": {
-          "title": "KSampler"
-        }
+        "class_type": "KSampler"
       },
       "4": {
-        "inputs": {
-          "ckpt_name": "v1-5-pruned-emaonly-fp16.safetensors"
-        },
-        "class_type": "CheckpointLoaderSimple",
-        "_meta": {
-          "title": "Load Checkpoint"
-        }
+        "inputs": {"ckpt_name": "v1-5-pruned-emaonly-fp16.safetensors"},
+        "class_type": "CheckpointLoaderSimple"
       },
       "5": {
-        "inputs": {
-          "width": 512,
-          "height": 512,
-          "batch_size": 1
-        },
-        "class_type": "EmptyLatentImage",
-        "_meta": {
-          "title": "Empty Latent Image"
-        }
+        "inputs": {"width": 512, "height": 512, "batch_size": 1},
+        "class_type": "EmptyLatentImage"
       },
       "6": {
-        "inputs": {
-          "text": "beautiful scenery nature glass bottle landscape, , purple galaxy bottle,",
-          "clip": [
-            "4",
-            1
-          ]
-        },
-        "class_type": "CLIPTextEncode",
-        "_meta": {
-          "title": "CLIP Text Encode (Prompt)"
-        }
+        "inputs": {"text": "beautiful scenery nature glass bottle landscape, purple galaxy bottle", "clip": ["4", 1]},
+        "class_type": "CLIPTextEncode"
       },
       "7": {
-        "inputs": {
-          "text": "text, watermark",
-          "clip": [
-            "4",
-            1
-          ]
-        },
-        "class_type": "CLIPTextEncode",
-        "_meta": {
-          "title": "CLIP Text Encode (Prompt)"
-        }
+        "inputs": {"text": "text, watermark", "clip": ["4", 1]},
+        "class_type": "CLIPTextEncode"
       },
       "8": {
-        "inputs": {
-          "samples": [
-            "3",
-            0
-          ],
-          "vae": [
-            "4",
-            2
-          ]
-        },
-        "class_type": "VAEDecode",
-        "_meta": {
-          "title": "VAE Decode"
-        }
+        "inputs": {"samples": ["3", 0], "vae": ["4", 2]},
+        "class_type": "VAEDecode"
       },
       "9": {
-        "inputs": {
-          "filename_prefix": "ComfyUI",
-          "images": [
-            "8",
-            0
-          ]
-        },
-        "class_type": "SaveImage",
-        "_meta": {
-          "title": "Save Image"
-        }
+        "inputs": {"filename_prefix": "ComfyUI", "images": ["8", 0]},
+        "class_type": "SaveImage"
       }
     },
     "s3": {
@@ -117,10 +51,9 @@
     },
     "webhook": {
       "url": "",
-      "extra_params": {
-        "user_id": "12345",
-        "project_id": "abc-def"
-      }
-    }
+      "secret": "REPLACE_WITH_YOUR_WEBHOOK_SECRET",
+      "extra_params": {}
+    },
+    "return_outputs_as_base64": false
   }
 }

@@ -6,6 +6,7 @@
       "prompt": "A beautiful sunset over mountains, photorealistic",
       "negative_prompt": "blurry, low quality",
       "ckpt_name": "v1-5-pruned-emaonly-fp16.safetensors",
+      "seed": "__RANDOM_INT__",
       "steps": 20,
       "cfg_scale": 8.0,
       "width": 512,
@@ -21,10 +22,12 @@
     },
     "webhook": {
       "url": "",
+      "secret": "REPLACE_WITH_YOUR_WEBHOOK_SECRET",
       "extra_params": {
         "user_id": "12345",
         "project_id": "abc-def"
       }
-    }
+    },
+    "return_outputs_as_base64": false
   }
 }

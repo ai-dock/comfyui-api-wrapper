@@ -1,4 +1,5 @@
 import asyncio
+import os
 import uuid
 import logging
 import json
@@ -18,7 +19,11 @@ import time
 import aiofiles
 
 import aiohttp
-from config import CACHE_TYPE, WORKER_CONFIG, DEBUG_ENABLED, CACHE_TTL, COMFYUI_API_SYSTEM_STATS
+from config import (
+    CACHE_TYPE, WORKER_CONFIG, DEBUG_ENABLED, CACHE_TTL,
+    COMFYUI_API_SYSTEM_STATS, COMFYUI_BACKENDS, comfyui_urls,
+    REDIS_CONFIG,
+)
 from requestmodels.models import Payload
 from responses.result import Result
 from workers.preprocess_worker import PreprocessWorker
@@ -56,18 +61,79 @@ async def add_reverse_proxy_headers(request: Request, call_next):
     return response
 
 
-# Cache configuration - no changes needed, workers handle progress tracking
-if CACHE_TYPE == "redis":
-    request_store = Cache(Cache.REDIS, namespace="request_store", ttl=CACHE_TTL)
-    response_store = Cache(Cache.REDIS, namespace="response_store", ttl=CACHE_TTL)
-else:
-    request_store = SimpleMemoryCache(namespace="request_store", ttl=CACHE_TTL)
-    response_store = SimpleMemoryCache(namespace="response_store", ttl=CACHE_TTL)
+# Cache configuration. The request and response stores back the
+# wrapper's job state; both must agree on the backend so a worker
+# task that wrote the result can be read back by /result/{id}.
+#
+# `memory` is a per-process dict and is fine for a single wrapper
+# replica. `redis` shares state across replicas — required if you
+# ever run >1 wrapper process behind a load balancer, and useful
+# even single-replica because results survive a wrapper restart
+# (within CACHE_TTL).
+def _build_cache(namespace: str):
+    if CACHE_TYPE == "redis":
+        # aiocache reads endpoint/port/db/password as kwargs, NOT
+        # from a config dict. Pass them through explicitly.
+        kwargs = {
+            "endpoint":         REDIS_CONFIG["host"],
+            "port":             REDIS_CONFIG["port"],
+            "db":               REDIS_CONFIG["db"],
+            "namespace":        namespace,
+            "ttl":              CACHE_TTL,
+        }
+        if REDIS_CONFIG.get("password"):
+            kwargs["password"] = REDIS_CONFIG["password"]
+        return Cache(Cache.REDIS, **kwargs)
+    return SimpleMemoryCache(namespace=namespace, ttl=CACHE_TTL)
 
-# Processing queues (defined outside cache logic)
-preprocess_queue = asyncio.Queue()    
+
+request_store  = _build_cache("request_store")
+response_store = _build_cache("response_store")
+
+# Processing queues. preprocess is bounded so the wrapper can shed
+# load with 503 + Retry-After when saturated rather than silently
+# stacking work that may never drain. generation/postprocess are
+# unbounded — work flows from preprocess through these in fixed
+# steps, so they can't grow beyond what preprocess admits.
+_MAX_QUEUE_SIZE = WORKER_CONFIG["max_queue_size"]
+preprocess_queue = asyncio.Queue(maxsize=_MAX_QUEUE_SIZE)
 generation_queue = asyncio.Queue()
 postprocess_queue = asyncio.Queue()
+
+
+# Slim Result envelopes by default — the customer can opt back into
+# the full ComfyUI history blob via env var or per-request header.
+# Saves ~5KB per response in the common case.
+_INCLUDE_COMFYUI_RESPONSE_DEFAULT = os.getenv("INCLUDE_COMFYUI_RESPONSE", "false").lower() == "true"
+
+
+def _apply_base64_header(request: Request, payload):
+    """If the caller set `X-Return-Outputs-As-Base64: 1`, flip the
+    payload's opt-in flag so postprocess inlines outputs. Lets
+    `curl -H 'X-...: 1' ...` enable the feature without touching
+    the body. Per-payload `input.return_outputs_as_base64: true`
+    works the same and survives the absence of this header."""
+    hdr = request.headers.get("x-return-outputs-as-base64")
+    if hdr is not None and hdr.strip().lower() in ("1", "true", "yes", "on"):
+        payload.input.return_outputs_as_base64 = True
+
+
+def _shape_result(result, request: "Request | None" = None):
+    """Return a copy of `result` with `comfyui_response` stripped to
+    `{}` unless the caller opted in.
+
+    Per-request override: header `X-Include-ComfyUI-Response: 1`.
+    Global default: env `INCLUDE_COMFYUI_RESPONSE=true`.
+    """
+    include = _INCLUDE_COMFYUI_RESPONSE_DEFAULT
+    if request is not None:
+        hdr = request.headers.get("x-include-comfyui-response")
+        if hdr is not None:
+            include = hdr.strip().lower() in ("1", "true", "yes", "on")
+    if include:
+        return result
+    # Pydantic copy-with-update — leaves the original untouched.
+    return result.model_copy(update={"comfyui_response": {}})
 
 
 @app.on_event("startup")
@@ -95,9 +161,17 @@ async def main():
     preprocess_workers = [PreprocessWorker(i, worker_config) for i in range(1, WORKER_CONFIG["preprocess_workers"] + 1)]
     preprocess_tasks = [asyncio.create_task(worker.work()) for worker in preprocess_workers]
 
-    # Generation workers from configuration
-    generation_workers = [GenerationWorker(i, worker_config) for i in range(1, WORKER_CONFIG["generation_workers"] + 1)]
+    # Generation workers — one per configured ComfyUI backend.
+    # Each is pinned to its backend's URL; N workers reading from
+    # the same `generation_queue` form a natural pool. The legacy
+    # `WORKER_CONFIG["generation_workers"]` knob is ignored when
+    # `COMFYUI_BACKENDS` is set (count is implicit from the list).
+    generation_workers = [
+        GenerationWorker(i + 1, worker_config, backend_url=url)
+        for i, url in enumerate(COMFYUI_BACKENDS)
+    ]
     generation_tasks = [asyncio.create_task(worker.work()) for worker in generation_workers]
+    logger.info(f"Generation workers bound to backends: {COMFYUI_BACKENDS}")
 
     postprocess_workers = [PostprocessWorker(i, worker_config) for i in range(1, WORKER_CONFIG["postprocess_workers"] + 1)]
     postprocess_tasks = [asyncio.create_task(worker.work()) for worker in postprocess_workers]
@@ -316,6 +390,7 @@ def markdown_to_html(markdown_text: str) -> str:
 # ===== ASYNC ENDPOINT (renamed from /payload) =====
 @app.post('/generate', response_model=Result)
 async def generate(
+    request: Request,
     response: Response,
     payload: Annotated[
         Payload,
@@ -328,18 +403,36 @@ async def generate(
     if not payload.input.request_id:
         payload.input.request_id = str(uuid.uuid4())
     request_id = payload.input.request_id
-    
+    _apply_base64_header(request, payload)
+
+    # Backpressure: if the preprocess queue is full, the wrapper is
+    # already at capacity. Shed load with 503 so the caller can
+    # retry / route to another pod, rather than queue work that
+    # may never drain.
+    try:
+        preprocess_queue.put_nowait(request_id)
+    except asyncio.QueueFull:
+        logger.warning(
+            f"Rejecting {request_id}: preprocess queue full ({preprocess_queue.qsize()}/{_MAX_QUEUE_SIZE})"
+        )
+        response.status_code = 503
+        response.headers["Retry-After"] = "5"
+        return Result(
+            id=request_id,
+            status="failed",
+            message=f"Worker at capacity ({_MAX_QUEUE_SIZE} in flight); retry shortly",
+        )
+
     result_pending = Result(id=request_id)
 
     try:
         # Store request and initial result
         await request_store.set(request_id, payload)
         await response_store.set(request_id, result_pending)
-        await preprocess_queue.put(request_id)
-        
+
         logger.info(f"Queued request {request_id}")
         response.status_code = 202
-        return result_pending
+        return _shape_result(result_pending, request)
     except Exception as e:
         logger.error(f"Failed to queue request {request_id}: {e}")
         response.status_code = 500  # Internal Server Error
@@ -348,7 +441,7 @@ async def generate(
             status="failed",
             message=f"Failed to queue request: {str(e)}"
         )
-        return failed_result
+        return _shape_result(failed_result, request)
 
 # ===== SYNCHRONOUS ENDPOINT =====
 @asynccontextmanager
@@ -389,11 +482,26 @@ async def generate_sync(
     if not payload.input.request_id:
         payload.input.request_id = str(uuid.uuid4())
     request_id = payload.input.request_id
+    _apply_base64_header(request, payload)
+
+    # Backpressure (see /generate for rationale).
+    try:
+        preprocess_queue.put_nowait(request_id)
+    except asyncio.QueueFull:
+        logger.warning(
+            f"Rejecting {request_id}: preprocess queue full ({preprocess_queue.qsize()}/{_MAX_QUEUE_SIZE})"
+        )
+        response.status_code = 503
+        response.headers["Retry-After"] = "5"
+        return Result(
+            id=request_id,
+            status="failed",
+            message=f"Worker at capacity ({_MAX_QUEUE_SIZE} in flight); retry shortly",
+        )
 
     result_pending = Result(id=request_id)
     await request_store.set(request_id, payload)
     await response_store.set(request_id, result_pending)
-    await preprocess_queue.put(request_id)
 
     logger.info(f"Queued synchronous request {request_id}")
 
@@ -401,8 +509,8 @@ async def generate_sync(
         async with cancel_on_disconnect(request, request_id):
             while True:
                 result = await response_store.get(request_id)
-                if result and result.status in ["completed", "failed", "timeout", "cancelled"]:
-                    return result
+                if result and result.status in ("completed", "failed", "cancelled"):
+                    return _shape_result(result, request)
                 await asyncio.sleep(0.5)
 
     except asyncio.CancelledError:
@@ -419,6 +527,7 @@ async def generate_sync(
 # ===== STREAMING ENDPOINT =====
 @app.post('/generate/stream')
 async def generate_stream(
+    request: Request,
     payload: Annotated[
         Payload,
         Body(
@@ -430,15 +539,31 @@ async def generate_stream(
     if not payload.input.request_id:
         payload.input.request_id = str(uuid.uuid4())
     request_id = payload.input.request_id
+    _apply_base64_header(request, payload)
     
     result_pending = Result(id=request_id)
+
+    # Backpressure (see /generate for rationale). Stream variant
+    # raises HTTPException so FastAPI emits a JSON 503 instead of
+    # opening an SSE stream that immediately closes.
+    try:
+        preprocess_queue.put_nowait(request_id)
+    except asyncio.QueueFull:
+        from fastapi import HTTPException
+        logger.warning(
+            f"Rejecting {request_id}: preprocess queue full ({preprocess_queue.qsize()}/{_MAX_QUEUE_SIZE})"
+        )
+        raise HTTPException(
+            status_code=503,
+            detail=f"Worker at capacity ({_MAX_QUEUE_SIZE} in flight); retry shortly",
+            headers={"Retry-After": "5"},
+        )
 
     try:
         # Store request and initial result
         await request_store.set(request_id, payload)
         await response_store.set(request_id, result_pending)
-        await preprocess_queue.put(request_id)
-        
+
         logger.info(f"Starting stream for request {request_id}")
         
         # Return streaming response
@@ -465,7 +590,7 @@ async def _mark_request_cancelled(request_id: str):
         result = await response_store.get(request_id)
         if result:
             # Only update if not already in a terminal state
-            if result.status not in ['completed', 'failed', 'timeout', 'cancelled']:
+            if result.status not in ("completed", "failed", "cancelled"):
                 result.status = "cancelled"
                 result.message = "Request cancelled due to client disconnection"
                 await response_store.set(request_id, result)
@@ -532,9 +657,11 @@ async def _stream_status_updates(request_id: str):
                 last_result = current_result
                 last_queue_position = queue_position
             
-            # Check if processing is complete
+            # Check if processing is complete. `cancelled` is a
+            # terminal state too — without it here the stream
+            # would hang indefinitely on a cancelled job.
             if current_result and hasattr(current_result, 'status'):
-                if current_result.status in ['completed', 'failed', 'timeout']:
+                if current_result.status in ('completed', 'failed', 'cancelled'):
                     # Send final result
                     final_data = {
                         "request_id": request_id,
@@ -558,58 +685,79 @@ async def _stream_status_updates(request_id: str):
             break
 
 
-def _get_queue_position(request_id: str) -> dict:
-    """Get the current position of request_id in queues"""
-    position_info = {
-        "current_queue": None,
-        "position": 0,
-        "queue_size": 0,
-        "estimated_wait_time": None
-    }
-    
+def _peek_queue_items(q: asyncio.Queue) -> list:
+    """Snapshot the items currently waiting in an asyncio.Queue
+    without removing them.
+
+    asyncio.Queue exposes no public peek/iterate API, so we read
+    the internal `_queue` deque directly. This has been a stable
+    CPython attribute since Py3.0 — but it IS private, so we
+    guard with getattr + an iteration fallback. The list() call
+    is atomic in single-threaded asyncio (no await inside) so
+    there's no race against concurrent put/get operations.
+    """
+    inner = getattr(q, "_queue", None)
+    if inner is None:
+        return []
     try:
-        # Check preprocess queue
-        preprocess_items = list(preprocess_queue._queue)
-        if request_id in preprocess_items:
-            position = preprocess_items.index(request_id) + 1  # 1-based position
+        return list(inner)
+    except Exception:
+        return []
+
+
+# Per-stage wait-time heuristics (seconds per job). The generation
+# value gets divided by the number of generation workers — see
+# below. Tune freely; these are operator-facing hints, not SLAs.
+_QUEUE_STAGE_TABLE = (
+    # (queue ref builder,           public name,        per-job seconds)
+    (lambda: preprocess_queue,      "preprocessing",    30),
+    (lambda: generation_queue,      "generation",      120),
+    (lambda: postprocess_queue,     "postprocessing",   20),
+)
+
+
+def _get_queue_position(request_id: str) -> dict:
+    """Locate `request_id` in the three pipeline queues. Returns
+    the matching stage's name + 1-based position + queue size + a
+    rough wait-time estimate. When the id isn't in any queue, it's
+    either in flight at a worker or completed — return
+    `current_queue: "processing"`.
+    """
+    position_info = {
+        "current_queue":       None,
+        "position":            0,
+        "queue_size":          0,
+        "estimated_wait_time": None,
+    }
+    try:
+        # Generation drains in parallel — N workers, one per
+        # configured backend. Divide the per-position estimate so
+        # multi-backend pods don't quote N× the actual wait.
+        n_gen_workers = max(1, len(COMFYUI_BACKENDS))
+
+        for queue_ref, stage_name, secs_per_job in _QUEUE_STAGE_TABLE:
+            q = queue_ref()
+            items = _peek_queue_items(q)
+            if request_id not in items:
+                continue
+            position = items.index(request_id) + 1
+            divisor = n_gen_workers if stage_name == "generation" else 1
+            wait = (position * secs_per_job) // divisor
             position_info.update({
-                "current_queue": "preprocessing",
-                "position": position,
-                "queue_size": len(preprocess_items),
-                "estimated_wait_time": position * 30  # Rough estimate: 30s per preprocessing job
+                "current_queue":       stage_name,
+                "position":            position,
+                "queue_size":          len(items),
+                "estimated_wait_time": wait,
             })
             return position_info
-        
-        # Check generation queue
-        generation_items = list(generation_queue._queue)
-        if request_id in generation_items:
-            position = generation_items.index(request_id) + 1
-            position_info.update({
-                "current_queue": "generation", 
-                "position": position,
-                "queue_size": len(generation_items),
-                "estimated_wait_time": position * 120  # Rough estimate: 2min per generation job
-            })
-            return position_info
-        
-        # Check postprocess queue
-        postprocess_items = list(postprocess_queue._queue)
-        if request_id in postprocess_items:
-            position = postprocess_items.index(request_id) + 1
-            position_info.update({
-                "current_queue": "postprocessing",
-                "position": position, 
-                "queue_size": len(postprocess_items),
-                "estimated_wait_time": position * 20  # Rough estimate: 20s per postprocessing job
-            })
-            return position_info
-        
-        # Not in any queue - likely being processed or completed
+
+        # Not in any queue — either being processed by a worker or
+        # already completed.
         position_info.update({
-            "current_queue": "processing",
-            "position": 0,
-            "queue_size": 0,
-            "estimated_wait_time": 0
+            "current_queue":       "processing",
+            "position":            0,
+            "queue_size":          0,
+            "estimated_wait_time": 0,
         })
         
     except Exception as e:
@@ -660,20 +808,20 @@ def _serialize_result(result) -> dict:
 
 
 @app.get('/result/{request_id}', response_model=Result, status_code=200)
-async def result(request_id: str, response: Response):
+async def result(request_id: str, request: Request, response: Response):
     """Get the result of a processing request"""
     try:
         result = await response_store.get(request_id)
         if not result:
             result = Result(id=request_id, status="failed", message="Request ID not found")
             response.status_code = 404
-        
-        return result
+
+        return _shape_result(result, request)
     except Exception as e:
         logger.error(f"Failed to get result for {request_id}: {e}")
         result = Result(id=request_id, status="failed", message="Internal server error")
         response.status_code = 500
-        return result
+        return _shape_result(result, request)
 
 @app.post('/cancel/{request_id}', status_code=200)
 async def cancel_request_simple(
@@ -690,7 +838,7 @@ async def cancel_request_simple(
             return {"error": f"Request {request_id} not found"}
         
         # Check if already in a terminal state
-        if result.status in ['completed', 'failed', 'timeout', 'cancelled']:
+        if result.status in ("completed", "failed", "cancelled"):
             return {
                 "message": f"Request {request_id} is already {result.status}",
                 "status": result.status
@@ -724,34 +872,89 @@ async def queue_info():
 
 @app.get('/health', response_model=dict)
 async def health(response: Response):
-    """Health check endpoint - returns healthy only if ComfyUI system stats is accessible"""
+    """Health check endpoint.
+
+    Walks every configured ComfyUI backend (`COMFYUI_BACKENDS`)
+    plus the per-backend GPU latch. Returns 200 + healthy only when
+    ALL backends pass HTTP + WS probes AND no GPU is latched as
+    unrecoverable. Returns 503 if any backend fails — losing one
+    ComfyUI process means losing 1/N of the pod's capacity, and
+    replacing the whole pod is the simplest correct response for
+    most orchestrators.
+
+    Body shape exposes both an aggregate (`status`, `gpu`,
+    `backends_healthy`) and per-backend detail (`backends[]`) so
+    operators can see which backend failed without parsing logs.
+    """
+    from workers.generation_worker import get_gpu_state
+
+    backends_detail = []
+    n_healthy = 0
+
+    async def _probe(urls: dict) -> dict:
+        """One backend's HTTP + WS probe."""
+        info = {
+            "base":         urls["base"],
+            "http_ok":      False,
+            "websocket_ok": False,
+        }
+        try:
+            t = aiohttp.ClientTimeout(total=5)
+            async with aiohttp.ClientSession(timeout=t) as session:
+                async with session.get(urls["system_stats"]) as r:
+                    if r.status == 200:
+                        info["http_ok"] = True
+                        info["system_stats"] = await r.json()
+                    else:
+                        info["http_error"] = f"system_stats returned {r.status}"
+        except aiohttp.ClientError as e:
+            info["http_error"] = f"connect failed: {e}"
+        except Exception as e:
+            info["http_error"] = f"unexpected: {e}"
+
+        try:
+            t = aiohttp.ClientTimeout(total=2.0)
+            async with aiohttp.ClientSession(timeout=t) as session:
+                async with session.ws_connect(
+                    urls["websocket"], params={"clientId": "healthcheck"}
+                ) as ws:
+                    info["websocket_ok"] = True
+                    await ws.close()
+        except Exception as e:
+            info["websocket_error"] = f"{e}"
+
+        return info
+
+    for backend_url in COMFYUI_BACKENDS:
+        urls = comfyui_urls(backend_url)
+        info = await _probe(urls)
+        # Per-backend GPU latch.
+        gpu_state = get_gpu_state(backend_url)
+        info["gpu"] = gpu_state
+        info["healthy"] = (
+            info["http_ok"]
+            and info["websocket_ok"]
+            and not gpu_state["unrecoverable"]
+        )
+        if info["healthy"]:
+            n_healthy += 1
+        backends_detail.append(info)
+
+    aggregate_gpu = get_gpu_state()
     health_response = {
-        "status": "healthy",
+        "status": "healthy" if n_healthy == len(COMFYUI_BACKENDS) else "unhealthy",
         "cache_type": CACHE_TYPE,
         "queues": {
             "preprocess": preprocess_queue.qsize(),
             "generation": generation_queue.qsize(),
             "postprocess": postprocess_queue.qsize(),
-        }
+        },
+        "backends_healthy": f"{n_healthy}/{len(COMFYUI_BACKENDS)}",
+        "gpu":      {"unrecoverable": aggregate_gpu["unrecoverable"], "reason": aggregate_gpu["reason"]},
+        "backends": backends_detail,
     }
 
-    try:
-        timeout = aiohttp.ClientTimeout(total=5)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(COMFYUI_API_SYSTEM_STATS) as stats_response:
-                if stats_response.status != 200:
-                    health_response["status"] = "unhealthy"
-                    health_response["comfyui_error"] = f"System stats returned status {stats_response.status}"
-                    response.status_code = 502
-                else:
-                    health_response["comfyui_system_stats"] = await stats_response.json()
-    except aiohttp.ClientError as e:
-        health_response["status"] = "unhealthy"
-        health_response["comfyui_error"] = f"Failed to connect to ComfyUI: {str(e)}"
-        response.status_code = 502
-    except Exception as e:
-        health_response["status"] = "unhealthy"
-        health_response["comfyui_error"] = f"Unexpected error: {str(e)}"
-        response.status_code = 502
+    if health_response["status"] != "healthy":
+        response.status_code = 503
 
     return health_response
