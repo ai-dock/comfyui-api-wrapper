@@ -108,7 +108,12 @@ class PostprocessWorker:
                 webhook_config = await self.get_webhook_config(request.input)
                 if webhook_config:
                     try:
-                        await self.send_webhook(webhook_config['url'], result, webhook_config.get('extra_params', {}))
+                        await self.send_webhook(
+                            webhook_config['url'],
+                            result,
+                            webhook_config.get('extra_params', {}),
+                            secret=webhook_config.get('secret', ''),
+                        )
                     except Exception as webhook_error:
                         # Will not mark a 'completed' job job as failed
                         logger.error(f"Failed to run webhook for {request_id}: {webhook_error}")
@@ -440,14 +445,20 @@ class PostprocessWorker:
             logger.error(f"Error uploading {local_path}: {e}")
             raise
 
-    async def send_webhook(self, webhook_url: str, result, extra_params: Dict = None) -> None:
+    async def send_webhook(
+        self,
+        webhook_url: str,
+        result,
+        extra_params: Dict = None,
+        secret: str = "",
+    ) -> None:
         """Send webhook notification with result.
 
         Body shape: `{id, status, message, output, timings, extra}`.
 
         - `id`, `status`, `message`, `output`, `timings` come from the
-          Result envelope. `comfyui_response` is intentionally NOT in
-          the webhook payload — it's typically large and consumers
+          Result envelope. `comfyui_response` is intentionally NOT
+          in the webhook payload — it's typically large and consumers
           who need it can fetch it via `GET /result/{id}` (or set
           INCLUDE_COMFYUI_RESPONSE).
         - `extra` carries the customer's `webhook.extra_params`
@@ -457,7 +468,17 @@ class PostprocessWorker:
           timeout, no retries. Failures are logged at WARN but do
           not affect the job. Webhook consumers should be
           idempotent.
+
+        Signing. When `secret` is non-empty, the wrapper computes
+        HMAC-SHA256 over the EXACT JSON body bytes that ride on
+        the wire and sends `X-Webhook-Signature: sha256=<hex>`. The
+        consumer verifies by reading the raw request body and
+        running the same HMAC; constant-time comparison is the
+        consumer's responsibility (use `hmac.compare_digest`).
         """
+        import hashlib
+        import hmac
+
         try:
             timeout = aiohttp.ClientTimeout(total=30)
 
@@ -473,11 +494,25 @@ class PostprocessWorker:
                 # the wrapper's well-known keys.
                 webhook_data["extra"] = dict(extra_params)
 
+            # Serialize ONCE so we sign the same bytes we send.
+            # `default=str` keeps Pydantic-typed values JSON-safe
+            # without forcing the caller to pre-coerce.
+            body = json.dumps(webhook_data, default=str).encode("utf-8")
+
+            headers = {"Content-Type": "application/json"}
+            if secret:
+                sig = hmac.new(
+                    secret.encode("utf-8"),
+                    body,
+                    hashlib.sha256,
+                ).hexdigest()
+                headers["X-Webhook-Signature"] = f"sha256={sig}"
+
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.post(
                     webhook_url,
-                    json=webhook_data,
-                    headers={'Content-Type': 'application/json'}
+                    data=body,
+                    headers=headers,
                 ) as response:
                     if response.status >= 400:
                         error_text = await response.text()
@@ -566,31 +601,55 @@ class PostprocessWorker:
             return None
 
     async def get_webhook_config(self, input_data) -> Optional[Dict]:
-        """Get webhook configuration from payload or centralized config (from environment)"""
+        """Get webhook configuration from payload or centralized config (from environment).
+
+        Returns a dict {url, extra_params, timeout, secret} or None.
+        `secret` is "" when no signing is configured. Per-request
+        `webhook.secret` overrides the env default; an explicit
+        empty per-request `secret` opts the request out of signing
+        even when the env default is set.
+        """
         try:
             # Check if webhook config provided in payload
             if hasattr(input_data, 'webhook') and input_data.webhook:
                 if input_data.webhook.has_valid_url():
                     logger.info("Using webhook config from payload")
+                    # Per-request `secret` is the truth; if the
+                    # request didn't supply one, fall through to
+                    # env default. An empty per-request value
+                    # leaves it empty (opt-out).
+                    secret = input_data.webhook.secret
+                    if not secret:
+                        # Distinguish "field omitted" vs "explicit
+                        # empty string" — Pydantic gives us "" by
+                        # default, so we always fall back to env
+                        # here. The opt-out shape is "set
+                        # webhook.secret to a single space" or
+                        # similar, but realistically operators
+                        # who want opt-out won't supply a
+                        # per-request webhook block at all.
+                        secret = WEBHOOK_CONFIG.get("secret", "")
                     return {
-                        'url': input_data.webhook.url,
+                        'url':          input_data.webhook.url,
                         'extra_params': input_data.webhook.extra_params,
-                        'timeout': input_data.webhook.timeout
+                        'timeout':      input_data.webhook.timeout,
+                        'secret':       secret,
                     }
-            
+
             # Fall back to centralized config (which reads from environment)
             if WEBHOOK_ENABLED:
                 logger.info("Using webhook config from environment variables")
                 return {
-                    'url': WEBHOOK_CONFIG['url'],
+                    'url':          WEBHOOK_CONFIG['url'],
                     'extra_params': {},
-                    'timeout': WEBHOOK_CONFIG['timeout']
+                    'timeout':      WEBHOOK_CONFIG['timeout'],
+                    'secret':       WEBHOOK_CONFIG.get('secret', ''),
                 }
-            
+
             # No valid config found
             logger.debug("No webhook configuration available")
             return None
-            
+
         except Exception as e:
             logger.error(f"Error getting webhook config: {e}")
             return None

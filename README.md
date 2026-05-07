@@ -26,8 +26,8 @@ optional webhook), and returns a structured result envelope.
 - Optional output delivery in three independent modes (combine
   freely): S3 upload (presigned `url` per output), inline base64
   (`data` per output, opt-in), and fire-and-forget webhook
-  delivery of a slim summary envelope (no signing — see
-  [§ Webhook](#webhook)).
+  delivery of a slim summary envelope (HMAC-SHA256 signed when
+  a secret is configured — see [§ Webhook](#webhook)).
 - Three-stage internal pipeline (preprocess → generation →
   postprocess) with separate worker pools; bounded inbound queue
   with HTTP 503 + `Retry-After` when at capacity.
@@ -402,6 +402,7 @@ defaults for that single job.
 | Env | Notes |
 |---|---|
 | `WEBHOOK_URL`     | Default webhook endpoint; per-request `input.webhook.url` overrides. |
+| `WEBHOOK_SECRET`  | Optional. When set, the wrapper signs every outgoing webhook with HMAC-SHA256 over the body bytes and sends `X-Webhook-Signature: sha256=<hex>`. Per-request `input.webhook.secret` overrides. See [§ Verifying a webhook signature](#verifying-a-webhook-signature). |
 | `WEBHOOK_TIMEOUT` | Default `30`. Seconds. |
 
 ### Misc
@@ -468,16 +469,20 @@ to that URL after postprocess finishes. Body shape:
 
 Notes:
 
-- **No signing.** The wrapper does not HMAC-sign or otherwise
-  authenticate webhook bodies. Treat the URL itself as a shared
-  secret (use a unique-per-customer URL with an opaque path) or
-  add a reverse proxy that injects + verifies a signature
-  upstream.
-- **Fire-and-forget.** A single attempt with a 30 s timeout, no
-  retry. Failures are logged but don't affect the job. Webhook
-  consumers should be idempotent (the same `id` may not be
-  delivered twice in normal operation, but a flaky network can
-  produce ambiguous outcomes).
+- **HMAC-SHA256 signing** — opt-in via a shared secret, off by
+  default. Set `WEBHOOK_SECRET` (env, applies globally) or
+  per-request `input.webhook.secret` (overrides). When set, the
+  wrapper sends `X-Webhook-Signature: sha256=<hex>` computed
+  over the exact JSON body bytes the consumer receives. Per-
+  request `secret` takes precedence; supply an empty
+  per-request `secret` *together with* a per-request webhook
+  block to opt this request out of signing while leaving the
+  env default in place for other requests.
+- **Fire-and-forget delivery.** A single attempt with a 30 s
+  timeout, no retry. Failures are logged but don't affect the
+  job. Webhook consumers should be idempotent (the same `id`
+  may not be delivered twice in normal operation, but a flaky
+  network can produce ambiguous outcomes).
 - **No `comfyui_response`.** The full ComfyUI history blob is
   not in the webhook body — typically several KB and most
   consumers don't want it. Fetch it via `GET /result/{id}` if
@@ -485,7 +490,57 @@ Notes:
 - **`extra` is namespaced.** Customer-supplied `extra_params`
   land under the `extra` key, NOT merged into the top level —
   so `extra_params: {"status": "anything"}` can't clobber the
-  wrapper's `status` field.
+  wrapper's `status` field. The signature covers the full body
+  including `extra`.
+
+### Verifying a webhook signature
+
+Read the raw request body (NOT the parsed JSON dict — body bytes
+matter) and recompute the HMAC. Use a constant-time comparison.
+
+**Python (FastAPI / Flask):**
+
+```python
+import hmac, hashlib
+
+WEBHOOK_SECRET = b"shared-secret"
+
+def verify(raw_body: bytes, signature_header: str) -> bool:
+    if not signature_header.startswith("sha256="):
+        return False
+    expected = hmac.new(WEBHOOK_SECRET, raw_body, hashlib.sha256).hexdigest()
+    received = signature_header.split("=", 1)[1]
+    return hmac.compare_digest(received, expected)
+
+# In a FastAPI route:
+async def handler(request: Request):
+    raw = await request.body()
+    sig = request.headers.get("x-webhook-signature", "")
+    if not verify(raw, sig):
+        raise HTTPException(401, "Invalid webhook signature")
+    payload = json.loads(raw)
+    ...
+```
+
+**Node (Express):**
+
+```javascript
+const crypto = require('crypto');
+
+function verify(rawBody, signatureHeader, secret) {
+  if (!signatureHeader || !signatureHeader.startsWith('sha256=')) return false;
+  const expected = crypto.createHmac('sha256', secret).update(rawBody).digest('hex');
+  const received = signatureHeader.slice(7);
+  // Use timingSafeEqual to avoid timing-attack leakage.
+  const a = Buffer.from(expected, 'hex');
+  const b = Buffer.from(received, 'hex');
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+```
+
+The signature is over the wire bytes, so your handler must read
+the raw body before any JSON-parsing middleware mutates it
+(Express needs `express.raw({type: 'application/json'})`).
 
 ## Health endpoint
 

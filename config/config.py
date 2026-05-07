@@ -128,9 +128,15 @@ S3_ENABLED = bool(
 # output can't blow up the response store.
 OUTPUT_BASE64_MAX_BYTES = int(os.getenv("OUTPUT_BASE64_MAX_BYTES", str(10 * 1024 * 1024)))
 
-# Webhook Configuration (fallback from environment)
+# Webhook Configuration (fallback from environment).
+# `secret`, when set, enables HMAC-SHA256 signing of all
+# outgoing webhook bodies; per-request `webhook.secret` overrides.
+# An empty string in either position means "no signature header
+# on this request" — a per-request empty secret can opt-out even
+# when the env default is set.
 WEBHOOK_CONFIG = {
-    "url": os.getenv("WEBHOOK_URL", ""),
+    "url":     os.getenv("WEBHOOK_URL",     ""),
+    "secret":  os.getenv("WEBHOOK_SECRET",  ""),
     "timeout": int(os.getenv("WEBHOOK_TIMEOUT", "30"))
 }
 
