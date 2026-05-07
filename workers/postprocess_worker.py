@@ -435,22 +435,38 @@ class PostprocessWorker:
             raise
 
     async def send_webhook(self, webhook_url: str, result, extra_params: Dict = None) -> None:
-        """Send webhook notification with result"""
+        """Send webhook notification with result.
+
+        Body shape: `{id, status, message, output, timings, extra}`.
+
+        - `id`, `status`, `message`, `output`, `timings` come from the
+          Result envelope. `comfyui_response` is intentionally NOT in
+          the webhook payload — it's typically large and consumers
+          who need it can fetch it via `GET /result/{id}` (or set
+          INCLUDE_COMFYUI_RESPONSE).
+        - `extra` carries the customer's `webhook.extra_params`
+          verbatim if any. Namespaced under its own key so customer-
+          supplied fields can't clobber the system-level fields.
+        - Delivery is fire-and-forget: a single attempt with a 30s
+          timeout, no retries. Failures are logged at WARN but do
+          not affect the job. Webhook consumers should be
+          idempotent.
+        """
         try:
             timeout = aiohttp.ClientTimeout(total=30)
-            
-            # Prepare webhook payload
+
             webhook_data = {
-                "id": result.id,
-                "status": result.status,
+                "id":      result.id,
+                "status":  result.status,
                 "message": result.message,
-                "output": getattr(result, 'output', [])
+                "output":  getattr(result, "output",  []),
+                "timings": getattr(result, "timings", {}),
             }
-            
-            # Add extra parameters if provided
             if extra_params:
-                webhook_data.update(extra_params)
-            
+                # Namespaced — customer-supplied fields can't clobber
+                # the wrapper's well-known keys.
+                webhook_data["extra"] = dict(extra_params)
+
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.post(
                     webhook_url,
@@ -462,7 +478,7 @@ class PostprocessWorker:
                         logger.warning(f"Webhook failed (status {response.status}): {error_text}")
                     else:
                         logger.info(f"Webhook sent successfully to {webhook_url}")
-                        
+
         except Exception as e:
             logger.error(f"Error sending webhook to {webhook_url}: {e}")
             # Don't raise - webhook failures shouldn't fail the whole job

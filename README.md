@@ -24,7 +24,8 @@ optional webhook), and returns a structured result envelope.
   MIME-type-driven extension) into ComfyUI's `input/` directory
   and replaced with the local filename.
 - Optional S3 upload of generated outputs after completion;
-  optional HMAC-signed webhook delivery of the final result.
+  optional fire-and-forget webhook delivery of a slim summary
+  envelope (no signing — see [§ Webhook](#webhook)).
 - Three-stage internal pipeline (preprocess → generation →
   postprocess) with separate worker pools; bounded inbound queue
   with HTTP 503 + `Retry-After` when at capacity.
@@ -232,9 +233,11 @@ while True:
 ### Async + webhook
 
 Add `input.webhook.url` to the payload (or set the global
-`WEBHOOK_URL` env). The wrapper POSTs the final Result envelope
-to that URL after postprocess; the body is the same shape as
-`/result/{id}` returns.
+`WEBHOOK_URL` env). After postprocess the wrapper POSTs a slim
+summary to that URL — see [§ Webhook](#webhook) for the body
+shape and caveats. Consumers needing the full Result (including
+`comfyui_response`) should fetch it via `GET /result/{id}` from
+their webhook handler.
 
 ### Streaming
 
@@ -406,6 +409,44 @@ The wrapper does not start the ComfyUI processes itself —
 operator's responsibility (typically supervisord, systemd, or a
 process supervisor that reads container env). Pin each ComfyUI
 to its GPU via `CUDA_VISIBLE_DEVICES`.
+
+## Webhook
+
+When `input.webhook.url` is set on the request (or the
+`WEBHOOK_URL` env is set globally), the wrapper POSTs a summary
+to that URL after postprocess finishes. Body shape:
+
+```json
+{
+  "id":      "request-uuid",
+  "status":  "completed",
+  "message": "Processing complete.",
+  "output":  [ /* same as Result.output */ ],
+  "timings": { "preprocess_ms": 12, "generation_ms": 18412, "postprocess_ms": 743 },
+  "extra":   { /* whatever the customer put in webhook.extra_params */ }
+}
+```
+
+Notes:
+
+- **No signing.** The wrapper does not HMAC-sign or otherwise
+  authenticate webhook bodies. Treat the URL itself as a shared
+  secret (use a unique-per-customer URL with an opaque path) or
+  add a reverse proxy that injects + verifies a signature
+  upstream.
+- **Fire-and-forget.** A single attempt with a 30 s timeout, no
+  retry. Failures are logged but don't affect the job. Webhook
+  consumers should be idempotent (the same `id` may not be
+  delivered twice in normal operation, but a flaky network can
+  produce ambiguous outcomes).
+- **No `comfyui_response`.** The full ComfyUI history blob is
+  not in the webhook body — typically several KB and most
+  consumers don't want it. Fetch it via `GET /result/{id}` if
+  you need it, or set `INCLUDE_COMFYUI_RESPONSE=true`.
+- **`extra` is namespaced.** Customer-supplied `extra_params`
+  land under the `extra` key, NOT merged into the top level —
+  so `extra_params: {"status": "anything"}` can't clobber the
+  wrapper's `status` field.
 
 ## Health endpoint
 
@@ -621,10 +662,13 @@ left for integration testing in a downstream consumer.
 
 ## Limitations to know about
 
-- Cancellation is **soft**. The wrapper marks `cancelled` and
-  posts `/api/interrupt`, but ComfyUI may take a few seconds to
-  actually stop sampling. Long workflows: the cancel may complete
-  *after* an output has already been written.
+- Cancellation is **soft**, and only effective during preprocess
+  and generation. Once a job reaches postprocess (file moves, S3
+  upload, webhook delivery) cancel is a no-op — the postprocess
+  worker doesn't check the cancel marker. ComfyUI itself may also
+  take a few seconds to stop sampling after an `/api/interrupt`,
+  so a cancel that arrives mid-generation may complete *after* an
+  output has already been written.
 - The cache (`memory` or `redis`) holds Results for `CACHE_TTL`
   seconds. Don't rely on `/result/{id}` after that window.
 - `output[*].local_path` is internal to the wrapper container.
