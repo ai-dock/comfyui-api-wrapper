@@ -712,6 +712,37 @@ submission. Any string that parses as an HTTP/HTTPS URL is:
 Both raw-workflow and modifier-mode submissions go through this
 pass.
 
+### `__RANDOM_INT__` placeholder
+
+A second pre-submission pass (`BaseModifier.replace_random_ints`)
+walks the workflow and substitutes the literal string
+`__RANDOM_INT__` with a fresh `random.randint(0, 2**32 - 1)` per
+request. Most useful for the `seed` field of `KSampler`-style
+nodes — set it once in your stored workflow and every submission
+gets a fresh seed without client-side bookkeeping:
+
+```json
+"3": {
+  "inputs": { "seed": "__RANDOM_INT__", "steps": 20, ... },
+  "class_type": "KSampler"
+}
+```
+
+Two substitution shapes:
+
+- **Whole-string match.** When the entire field is exactly
+  `"__RANDOM_INT__"`, the result replaces the string with an
+  actual integer. ComfyUI's `seed` and similar int-typed inputs
+  need this — a string would fail the schema validator.
+- **Embedded match.** When the placeholder is a substring of a
+  larger value (e.g. `"prefix-__RANDOM_INT__"`), the result is
+  still a string but with the placeholder replaced. Useful for
+  filename prefixes.
+
+Each occurrence is independent — multiple `__RANDOM_INT__` fields
+in one workflow get distinct random values. Both raw-workflow and
+modifier-mode submissions go through this pass.
+
 ## Error handling
 
 | HTTP | When |
