@@ -22,6 +22,7 @@ import aiohttp
 from config import (
     CACHE_TYPE, WORKER_CONFIG, DEBUG_ENABLED, CACHE_TTL,
     COMFYUI_API_SYSTEM_STATS, COMFYUI_BACKENDS, comfyui_urls,
+    REDIS_CONFIG,
 )
 from requestmodels.models import Payload
 from responses.result import Result
@@ -60,13 +61,34 @@ async def add_reverse_proxy_headers(request: Request, call_next):
     return response
 
 
-# Cache configuration - no changes needed, workers handle progress tracking
-if CACHE_TYPE == "redis":
-    request_store = Cache(Cache.REDIS, namespace="request_store", ttl=CACHE_TTL)
-    response_store = Cache(Cache.REDIS, namespace="response_store", ttl=CACHE_TTL)
-else:
-    request_store = SimpleMemoryCache(namespace="request_store", ttl=CACHE_TTL)
-    response_store = SimpleMemoryCache(namespace="response_store", ttl=CACHE_TTL)
+# Cache configuration. The request and response stores back the
+# wrapper's job state; both must agree on the backend so a worker
+# task that wrote the result can be read back by /result/{id}.
+#
+# `memory` is a per-process dict and is fine for a single wrapper
+# replica. `redis` shares state across replicas — required if you
+# ever run >1 wrapper process behind a load balancer, and useful
+# even single-replica because results survive a wrapper restart
+# (within CACHE_TTL).
+def _build_cache(namespace: str):
+    if CACHE_TYPE == "redis":
+        # aiocache reads endpoint/port/db/password as kwargs, NOT
+        # from a config dict. Pass them through explicitly.
+        kwargs = {
+            "endpoint":         REDIS_CONFIG["host"],
+            "port":             REDIS_CONFIG["port"],
+            "db":               REDIS_CONFIG["db"],
+            "namespace":        namespace,
+            "ttl":              CACHE_TTL,
+        }
+        if REDIS_CONFIG.get("password"):
+            kwargs["password"] = REDIS_CONFIG["password"]
+        return Cache(Cache.REDIS, **kwargs)
+    return SimpleMemoryCache(namespace=namespace, ttl=CACHE_TTL)
+
+
+request_store  = _build_cache("request_store")
+response_store = _build_cache("response_store")
 
 # Processing queues. preprocess is bounded so the wrapper can shed
 # load with 503 + Retry-After when saturated rather than silently

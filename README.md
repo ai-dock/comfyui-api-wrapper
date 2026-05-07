@@ -315,16 +315,27 @@ before giving up.
 |---|---|---|
 | `INCLUDE_COMFYUI_RESPONSE` | `false` | When `true`, every Result includes the full ComfyUI `/history` blob in `comfyui_response`. Off by default to keep responses small. Per-request override via `X-Include-ComfyUI-Response: 1`. |
 
-### Cache (request/response store)
+### Cache (request / response store)
+
+The request and response stores back the wrapper's job state.
+`memory` is a per-process dict — fine for a single wrapper
+replica; results are lost when the process restarts. `redis`
+shares state across replicas and survives wrapper restarts
+within `CACHE_TTL`.
 
 | Env | Default | Notes |
 |---|---|---|
-| `API_CACHE`      | `memory`    | `memory` (in-process) or `redis`. Use `redis` if you ever scale beyond one wrapper process per pod. |
-| `API_CACHE_TTL`  | `21600`     | Seconds. How long results stay retrievable via `/result/{id}`. |
+| `API_CACHE`      | `memory`    | `memory` or `redis`. |
+| `API_CACHE_TTL`  | `21600`     | Seconds (6 h). How long results stay retrievable via `/result/{id}`. |
 | `REDIS_HOST`     | `localhost` | Only when `API_CACHE=redis`. |
 | `REDIS_PORT`     | `6379`      | |
 | `REDIS_DB`       | `0`         | |
 | `REDIS_PASSWORD` | (empty)     | Optional. |
+
+`API_CACHE=redis` requires the optional `redis` package (already
+in `requirements.txt`). The wrapper passes `REDIS_HOST` /
+`REDIS_PORT` / `REDIS_DB` / `REDIS_PASSWORD` through to aiocache;
+keys are namespaced `request_store:` and `response_store:`.
 
 ### S3 upload (optional)
 
