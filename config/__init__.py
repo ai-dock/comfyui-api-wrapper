@@ -31,6 +31,9 @@ from .config import (
     # S3 Configuration
     S3_CONFIG,
     S3_ENABLED,
+
+    # Output base64 inlining
+    OUTPUT_BASE64_MAX_BYTES,
     
     # Webhook Configuration
     WEBHOOK_CONFIG,
@@ -67,6 +70,7 @@ __all__ = [
     'OUTPUT_DIR',
     'S3_CONFIG',
     'S3_ENABLED',
+    'OUTPUT_BASE64_MAX_BYTES',
     'WEBHOOK_CONFIG',
     'WEBHOOK_ENABLED',
     'WORKER_CONFIG',

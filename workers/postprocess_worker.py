@@ -58,16 +58,22 @@ class PostprocessWorker:
                 if hasattr(result, 'comfyui_response') and result.comfyui_response:
                     logger.info(f"Processing outputs for {request_id}")
                     logger.debug(f"ComfyUI response structure: {json.dumps(result.comfyui_response, indent=2)[:1000]}")
-                    
+
                     # Move generated assets to organized directory
                     await self.move_assets(request_id, result)
-                    
+
                     # Handle S3 upload - check payload first, then environment variables
                     s3_config = await self.get_s3_config(request.input)
                     if s3_config:
                         await self.upload_assets(request_id, s3_config, result)
                     else:
                         logger.info(f"No S3 configuration found for {request_id}, skipping upload")
+
+                    # Optionally inline outputs as base64 — coexists
+                    # with S3 (both `data` and `url` populated when
+                    # both are configured).
+                    if getattr(request.input, 'return_outputs_as_base64', False):
+                        await self.inline_outputs_as_base64(request_id, result)
                 else:
                     logger.info(f"No ComfyUI output for {request_id}, likely a failed job")
                     if hasattr(result, 'comfyui_response'):
@@ -482,6 +488,60 @@ class PostprocessWorker:
         except Exception as e:
             logger.error(f"Error sending webhook to {webhook_url}: {e}")
             # Don't raise - webhook failures shouldn't fail the whole job
+
+    async def inline_outputs_as_base64(self, request_id: str, result) -> None:
+        """For each entry in `result.output`, read the local file
+        and inline its bytes as base64 under `output[*].data`.
+        Sets `output[*].mimetype` from python-magic if available,
+        or content-type-by-extension otherwise.
+
+        Skips files larger than `OUTPUT_BASE64_MAX_BYTES` and
+        marks them with `output[*].error = "too large for base64"`
+        so the caller knows to fetch via S3 / `local_path` instead.
+        Coexists with S3: when both are configured the customer
+        gets both `data` and `url`.
+        """
+        from config import OUTPUT_BASE64_MAX_BYTES
+        import base64
+        try:
+            import magic            # python-magic — already a runtime dep
+            _mime = magic.Magic(mime=True)
+        except Exception:
+            _mime = None
+
+        if not hasattr(result, 'output') or not result.output:
+            return
+
+        for obj in result.output:
+            local_path = obj.get("local_path")
+            if not local_path:
+                continue
+            p = Path(local_path)
+            if not p.exists():
+                obj["error"] = f"local file missing: {local_path}"
+                continue
+            try:
+                size = p.stat().st_size
+            except OSError as e:
+                obj["error"] = f"stat failed: {e}"
+                continue
+            if size > OUTPUT_BASE64_MAX_BYTES:
+                obj["error"] = (
+                    f"file size {size} exceeds OUTPUT_BASE64_MAX_BYTES "
+                    f"({OUTPUT_BASE64_MAX_BYTES}); not inlined"
+                )
+                continue
+            try:
+                async with aiofiles.open(local_path, "rb") as f:
+                    raw = await f.read()
+                obj["data"]     = base64.b64encode(raw).decode("ascii")
+                obj["mimetype"] = _mime.from_buffer(raw) if _mime else "application/octet-stream"
+            except Exception as e:
+                logger.error(f"base64 inline failed for {local_path}: {e}")
+                obj["error"] = f"base64 inline failed: {e}"
+
+        n_inlined = sum(1 for o in result.output if "data" in o)
+        logger.info(f"Inlined {n_inlined}/{len(result.output)} outputs as base64 for {request_id}")
 
     async def get_s3_config(self, input_data) -> Optional[Dict]:
         """Get S3 configuration from payload or centralized config (from environment)"""

@@ -23,9 +23,11 @@ optional webhook), and returns a structured result envelope.
   that parses as a URL is downloaded (MD5-hashed cache,
   MIME-type-driven extension) into ComfyUI's `input/` directory
   and replaced with the local filename.
-- Optional S3 upload of generated outputs after completion;
-  optional fire-and-forget webhook delivery of a slim summary
-  envelope (no signing — see [§ Webhook](#webhook)).
+- Optional output delivery in three independent modes (combine
+  freely): S3 upload (presigned `url` per output), inline base64
+  (`data` per output, opt-in), and fire-and-forget webhook
+  delivery of a slim summary envelope (no signing — see
+  [§ Webhook](#webhook)).
 - Three-stage internal pipeline (preprocess → generation →
   postprocess) with separate worker pools; bounded inbound queue
   with HTTP 503 + `Retry-After` when at capacity.
@@ -145,6 +147,15 @@ async completion), and as the `result` payload of the final
 per-request) and the upload succeeded. With no S3 configured,
 files exist only at `local_path` inside the wrapper container.
 On upload failure `upload_error` is set and `url` is omitted.
+
+`output[*].data` (base64-encoded bytes) and `output[*].mimetype`
+are populated only when the customer opted in via either
+`input.return_outputs_as_base64: true` in the body or the
+`X-Return-Outputs-As-Base64: 1` request header. Files larger
+than `OUTPUT_BASE64_MAX_BYTES` (default 10 MB) are skipped with
+`output[*].error` set instead of `data`. Base64 mode coexists
+with S3 — both `data` and `url` are populated when both are
+configured.
 
 By default `comfyui_response` is `{}` to keep wire weight down.
 Set `INCLUDE_COMFYUI_RESPONSE=true` (env) or
@@ -339,6 +350,34 @@ within `CACHE_TTL`.
 in `requirements.txt`). The wrapper passes `REDIS_HOST` /
 `REDIS_PORT` / `REDIS_DB` / `REDIS_PASSWORD` through to aiocache;
 keys are namespaced `request_store:` and `response_store:`.
+
+### Inline base64 output (optional)
+
+When opted in, the postprocess worker reads each generated
+file and embeds it as base64 under `output[*].data` (with a
+sniffed `mimetype`). Useful for local dev (no S3 setup), small-
+image pipelines that don't want a separate fetch round-trip,
+and webhook consumers who otherwise get a useless internal
+`local_path`.
+
+Two ways to opt in (per-request):
+
+- **Body field**: `"input": {"return_outputs_as_base64": true, ...}`.
+- **Header**: `X-Return-Outputs-As-Base64: 1`. The header sets
+  the body field server-side, so the postprocess flow is
+  identical either way. Useful for `curl` and shell pipelines.
+
+| Env | Default | Notes |
+|---|---|---|
+| `OUTPUT_BASE64_MAX_BYTES` | `10485760` (10 MB) | Per-file cap. Files larger than this are skipped with `output[*].error` set; the rest still inline. |
+
+Base64 inflates payload size ~33%. The encoded `data` field
+sits in the response store for `CACHE_TTL` (default 6 h), so
+sustained traffic at large image sizes can chew memory — bump
+`API_CACHE=redis` if that's a concern, and tune `CACHE_TTL`.
+
+Coexists with S3: when both are configured, `data` and `url`
+are both populated and the customer picks.
 
 ### S3 upload (optional)
 

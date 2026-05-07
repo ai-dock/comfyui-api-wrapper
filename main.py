@@ -107,6 +107,17 @@ postprocess_queue = asyncio.Queue()
 _INCLUDE_COMFYUI_RESPONSE_DEFAULT = os.getenv("INCLUDE_COMFYUI_RESPONSE", "false").lower() == "true"
 
 
+def _apply_base64_header(request: Request, payload):
+    """If the caller set `X-Return-Outputs-As-Base64: 1`, flip the
+    payload's opt-in flag so postprocess inlines outputs. Lets
+    `curl -H 'X-...: 1' ...` enable the feature without touching
+    the body. Per-payload `input.return_outputs_as_base64: true`
+    works the same and survives the absence of this header."""
+    hdr = request.headers.get("x-return-outputs-as-base64")
+    if hdr is not None and hdr.strip().lower() in ("1", "true", "yes", "on"):
+        payload.input.return_outputs_as_base64 = True
+
+
 def _shape_result(result, request: "Request | None" = None):
     """Return a copy of `result` with `comfyui_response` stripped to
     `{}` unless the caller opted in.
@@ -392,6 +403,7 @@ async def generate(
     if not payload.input.request_id:
         payload.input.request_id = str(uuid.uuid4())
     request_id = payload.input.request_id
+    _apply_base64_header(request, payload)
 
     # Backpressure: if the preprocess queue is full, the wrapper is
     # already at capacity. Shed load with 503 so the caller can
@@ -470,6 +482,7 @@ async def generate_sync(
     if not payload.input.request_id:
         payload.input.request_id = str(uuid.uuid4())
     request_id = payload.input.request_id
+    _apply_base64_header(request, payload)
 
     # Backpressure (see /generate for rationale).
     try:
@@ -514,6 +527,7 @@ async def generate_sync(
 # ===== STREAMING ENDPOINT =====
 @app.post('/generate/stream')
 async def generate_stream(
+    request: Request,
     payload: Annotated[
         Payload,
         Body(
@@ -525,6 +539,7 @@ async def generate_stream(
     if not payload.input.request_id:
         payload.input.request_id = str(uuid.uuid4())
     request_id = payload.input.request_id
+    _apply_base64_header(request, payload)
     
     result_pending = Result(id=request_id)
 
@@ -670,58 +685,79 @@ async def _stream_status_updates(request_id: str):
             break
 
 
-def _get_queue_position(request_id: str) -> dict:
-    """Get the current position of request_id in queues"""
-    position_info = {
-        "current_queue": None,
-        "position": 0,
-        "queue_size": 0,
-        "estimated_wait_time": None
-    }
-    
+def _peek_queue_items(q: asyncio.Queue) -> list:
+    """Snapshot the items currently waiting in an asyncio.Queue
+    without removing them.
+
+    asyncio.Queue exposes no public peek/iterate API, so we read
+    the internal `_queue` deque directly. This has been a stable
+    CPython attribute since Py3.0 — but it IS private, so we
+    guard with getattr + an iteration fallback. The list() call
+    is atomic in single-threaded asyncio (no await inside) so
+    there's no race against concurrent put/get operations.
+    """
+    inner = getattr(q, "_queue", None)
+    if inner is None:
+        return []
     try:
-        # Check preprocess queue
-        preprocess_items = list(preprocess_queue._queue)
-        if request_id in preprocess_items:
-            position = preprocess_items.index(request_id) + 1  # 1-based position
+        return list(inner)
+    except Exception:
+        return []
+
+
+# Per-stage wait-time heuristics (seconds per job). The generation
+# value gets divided by the number of generation workers — see
+# below. Tune freely; these are operator-facing hints, not SLAs.
+_QUEUE_STAGE_TABLE = (
+    # (queue ref builder,           public name,        per-job seconds)
+    (lambda: preprocess_queue,      "preprocessing",    30),
+    (lambda: generation_queue,      "generation",      120),
+    (lambda: postprocess_queue,     "postprocessing",   20),
+)
+
+
+def _get_queue_position(request_id: str) -> dict:
+    """Locate `request_id` in the three pipeline queues. Returns
+    the matching stage's name + 1-based position + queue size + a
+    rough wait-time estimate. When the id isn't in any queue, it's
+    either in flight at a worker or completed — return
+    `current_queue: "processing"`.
+    """
+    position_info = {
+        "current_queue":       None,
+        "position":            0,
+        "queue_size":          0,
+        "estimated_wait_time": None,
+    }
+    try:
+        # Generation drains in parallel — N workers, one per
+        # configured backend. Divide the per-position estimate so
+        # multi-backend pods don't quote N× the actual wait.
+        n_gen_workers = max(1, len(COMFYUI_BACKENDS))
+
+        for queue_ref, stage_name, secs_per_job in _QUEUE_STAGE_TABLE:
+            q = queue_ref()
+            items = _peek_queue_items(q)
+            if request_id not in items:
+                continue
+            position = items.index(request_id) + 1
+            divisor = n_gen_workers if stage_name == "generation" else 1
+            wait = (position * secs_per_job) // divisor
             position_info.update({
-                "current_queue": "preprocessing",
-                "position": position,
-                "queue_size": len(preprocess_items),
-                "estimated_wait_time": position * 30  # Rough estimate: 30s per preprocessing job
+                "current_queue":       stage_name,
+                "position":            position,
+                "queue_size":          len(items),
+                "estimated_wait_time": wait,
             })
             return position_info
-        
-        # Check generation queue
-        generation_items = list(generation_queue._queue)
-        if request_id in generation_items:
-            position = generation_items.index(request_id) + 1
-            position_info.update({
-                "current_queue": "generation", 
-                "position": position,
-                "queue_size": len(generation_items),
-                "estimated_wait_time": position * 120  # Rough estimate: 2min per generation job
-            })
-            return position_info
-        
-        # Check postprocess queue
-        postprocess_items = list(postprocess_queue._queue)
-        if request_id in postprocess_items:
-            position = postprocess_items.index(request_id) + 1
-            position_info.update({
-                "current_queue": "postprocessing",
-                "position": position, 
-                "queue_size": len(postprocess_items),
-                "estimated_wait_time": position * 20  # Rough estimate: 20s per postprocessing job
-            })
-            return position_info
-        
-        # Not in any queue - likely being processed or completed
+
+        # Not in any queue — either being processed by a worker or
+        # already completed.
         position_info.update({
-            "current_queue": "processing",
-            "position": 0,
-            "queue_size": 0,
-            "estimated_wait_time": 0
+            "current_queue":       "processing",
+            "position":            0,
+            "queue_size":          0,
+            "estimated_wait_time": 0,
         })
         
     except Exception as e:

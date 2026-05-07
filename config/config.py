@@ -119,6 +119,15 @@ S3_ENABLED = bool(
     S3_CONFIG["bucket_name"]
 )
 
+# Output base64 inlining cap. When the customer opts in via
+# `input.return_outputs_as_base64: true` (or the
+# `X-Return-Outputs-As-Base64: 1` header), the postprocess worker
+# reads each generated file and embeds it as base64 under
+# `output[*].data`. Files larger than this cap are skipped (the
+# entry gets `output[*].error` set instead) so a single oversized
+# output can't blow up the response store.
+OUTPUT_BASE64_MAX_BYTES = int(os.getenv("OUTPUT_BASE64_MAX_BYTES", str(10 * 1024 * 1024)))
+
 # Webhook Configuration (fallback from environment)
 WEBHOOK_CONFIG = {
     "url": os.getenv("WEBHOOK_URL", ""),
