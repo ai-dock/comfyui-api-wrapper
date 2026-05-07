@@ -298,18 +298,43 @@ class PostprocessWorker:
             except Exception:
                 pass  # not under OUTPUT_DIR — let the original path through
 
+            # Same-file shortcut. When a request_id is reused AND
+            # ComfyUI's prompt cache hits with the same outputs,
+            # `original_path` is the symlink we wrote on the prior
+            # run; `original_path.resolve()` follows it into the
+            # per-request directory, where `dest_path` ALSO points.
+            # `shutil.copy2` would raise `SameFileError`. The file is
+            # already in the right place — return the result entry
+            # immediately and skip copy/symlink dance.
+            try:
+                if real_original_path == dest_path.resolve(strict=False):
+                    logger.info(
+                        f"Output {filename} already at destination "
+                        f"({real_original_path}); skipping copy"
+                    )
+                    return {
+                        "filename":    filename,
+                        "local_path":  str(dest_path),
+                        "type":        file_type,
+                        "subfolder":   subfolder,
+                        "node_id":     node_id,
+                        "output_type": output_type,
+                    }
+            except Exception:
+                pass  # fall through to the copy
+
             logger.debug(f"Copying {real_original_path} to {dest_path}")
-            
+
             # Copy the file (using real path to handle symlinks)
             await self._copy_file_async(real_original_path, dest_path)
-            
+
             # Remove original file/symlink and create new symlink pointing to our copy
             if original_path.exists() or original_path.is_symlink():
                 await self._remove_file_async(original_path)
-            
+
             # Create symlink from original location to our copy
             await self._create_symlink_async(dest_path, original_path)
-            
+
             logger.debug(f"Created symlink: {original_path} -> {dest_path}")
             
             # Return file info for result
