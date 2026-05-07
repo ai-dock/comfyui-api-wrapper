@@ -118,6 +118,53 @@ def _apply_base64_header(request: Request, payload):
         payload.input.return_outputs_as_base64 = True
 
 
+# Substrings that classify a `failed` result.message as an upstream
+# connectivity / timeout problem (ComfyUI wasn't reachable, /prompt
+# retries exhausted, ws connection lost) rather than a generation
+# error. Not exhaustive — additions welcome as new failure modes
+# surface in production.
+_UPSTREAM_FAIL_HINTS = (
+    "cannot connect",
+    "failed to post workflow after",
+    "network error",
+    "connection refused",
+    "websocket timeout",
+    "websocket failure",
+    "timed out",
+)
+
+
+def _http_status_for(result) -> int:
+    """Map a terminal Result to the HTTP status the endpoint should send.
+
+    The polling endpoints (`/generate/sync`, `/result/...`) historically
+    returned HTTP 200 regardless of the body's `status` field — so the
+    SDK's benchmark, which keys off HTTP status code, counted a 0.5s
+    "Cannot connect to host" failure as a successful 100-workload
+    request and reported a fake very-fast worker (perf=200).
+
+    Mapping:
+      completed   -> 200
+      cancelled   -> 499  (matches the client-disconnect path elsewhere)
+      failed      -> 502  if the message points at an upstream
+                          connectivity / timeout class issue
+                     500  otherwise (generation-side error: bad
+                          workflow, OOM, etc — still a real failure
+                          but not a gateway one)
+    """
+    status = getattr(result, "status", None)
+    if status == "completed":
+        return 200
+    if status == "cancelled":
+        return 499
+    # Treat anything else (failed, malformed, missing) as a server
+    # error — better to over-report 5xx than silently lie about success.
+    msg = (getattr(result, "message", "") or "").lower()
+    if any(hint in msg for hint in _UPSTREAM_FAIL_HINTS):
+        return 502
+    return 500
+
+
 def _shape_result(result, request: "Request | None" = None):
     """Return a copy of `result` with `comfyui_response` stripped to
     `{}` unless the caller opted in.
@@ -510,6 +557,11 @@ async def generate_sync(
             while True:
                 result = await response_store.get(request_id)
                 if result and result.status in ("completed", "failed", "cancelled"):
+                    # Reflect the body's status in the HTTP code so
+                    # callers (and benchmark drivers that key off HTTP
+                    # status) can't mistake a fast failure for a fast
+                    # success.
+                    response.status_code = _http_status_for(result)
                     return _shape_result(result, request)
                 await asyncio.sleep(0.5)
 
@@ -815,7 +867,15 @@ async def result(request_id: str, request: Request, response: Response):
         if not result:
             result = Result(id=request_id, status="failed", message="Request ID not found")
             response.status_code = 404
+            return _shape_result(result, request)
 
+        # Reflect terminal status in the HTTP code so a failed /
+        # cancelled job can't be misread as a success. In-progress
+        # states (pending, generating, processing, generated) stay at
+        # 200 so polling callers can distinguish "still working" from
+        # "done with status X".
+        if result.status in ("completed", "failed", "cancelled"):
+            response.status_code = _http_status_for(result)
         return _shape_result(result, request)
     except Exception as e:
         logger.error(f"Failed to get result for {request_id}: {e}")
