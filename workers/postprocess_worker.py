@@ -3,9 +3,25 @@ import asyncio
 import logging
 import os  # Still needed for symlink and remove operations
 import shutil
+import uuid
 from pathlib import Path
 from typing import Dict, List, Optional
 import json
+
+
+def _looks_like_request_id(name: str) -> bool:
+    """Return True if ``name`` matches the UUID format used for request IDs.
+
+    Used by the stale-cache guard in ``_process_output_file`` to decide
+    whether a non-self path component is "another request's directory"
+    (UUID-shaped — refuse) vs. a workflow-author subfolder convention
+    such as ``video/`` or ``images/`` (not UUID-shaped — accept).
+    """
+    try:
+        uuid.UUID(str(name))
+        return True
+    except (ValueError, AttributeError, TypeError):
+        return False
 
 import aiobotocore.session
 import aiofiles
@@ -282,17 +298,21 @@ class PostprocessWorker:
             # Defensive: when ComfyUI's history points at a path that
             # has been symlinked from a previous job's directory, we'd
             # otherwise copy that prior job's file as if it were ours.
-            # Only accept sources that are top-level under OUTPUT_DIR
-            # OR that live under a subdirectory whose first segment is
-            # this request_id.
+            # Reject only when the first path segment is a UUID-shaped
+            # request id that isn't ours — that's the actual stale-cache
+            # case. Non-UUID subfolders (workflow filename_prefix
+            # conventions like ``video/`` or ``images/``) are allowed
+            # through; rejecting them silently dropped legitimate
+            # outputs of any workflow that organised files into named
+            # subfolders.
             try:
                 rel = real_original_path.relative_to(self.output_dir)
                 rel_parts = rel.parts
-                if len(rel_parts) == 1:
-                    pass
-                elif rel_parts[0] == str(request_id):
-                    pass
-                else:
+                if (
+                    len(rel_parts) > 1
+                    and _looks_like_request_id(rel_parts[0])
+                    and rel_parts[0] != str(request_id)
+                ):
                     logger.debug(f"Skipping source from different request directory: {real_original_path}")
                     return None
             except Exception:
