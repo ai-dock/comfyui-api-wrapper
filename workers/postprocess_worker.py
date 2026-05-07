@@ -59,7 +59,12 @@ class PostprocessWorker:
 
             # Process the job
             logger.info(f"PostprocessWorker {self.worker_id} processing job: {request_id}")
-            
+
+            # Pre-initialise so the `finally` block below never sees an
+            # unbound name if `request_store.get` itself raises.
+            request = None
+            result = None
+
             try:
                 # Get request and result from stores
                 request = await self.request_store.get(request_id)
@@ -120,21 +125,50 @@ class PostprocessWorker:
                     logger.error(f"Failed to update result store for {request_id}: {store_error}")
             
             finally:
-                # Handle webhook - check payload first, then environment variables
-                webhook_config = await self.get_webhook_config(request.input)
-                if webhook_config:
-                    try:
-                        await self.send_webhook(
-                            webhook_config['url'],
-                            result,
-                            webhook_config.get('extra_params', {}),
-                            secret=webhook_config.get('secret', ''),
+                # Webhook dispatch is best-effort and MUST NOT escape
+                # this block. An unhandled exception here propagates
+                # out of `work()`'s `while True` loop and removes this
+                # worker from the asyncio.gather pool with no auto-
+                # restart. After enough such crashes the postprocess
+                # queue has no consumers and every subsequent request
+                # hangs forever.
+                #
+                # Two cases this guards against:
+                #   1. `request` is None — request_store had no entry
+                #      (e.g. a duplicate postprocess_queue entry, or a
+                #      cleanup race). Without the None check, the
+                #      original code dereferenced `request.input` and
+                #      crashed the worker.
+                #   2. `get_webhook_config` itself raises — defence in
+                #      depth so a future bug in config resolution
+                #      can't kill the pool the same way.
+                try:
+                    if request is not None:
+                        webhook_config = await self.get_webhook_config(request.input)
+                        if webhook_config:
+                            try:
+                                await self.send_webhook(
+                                    webhook_config['url'],
+                                    result,
+                                    webhook_config.get('extra_params', {}),
+                                    secret=webhook_config.get('secret', ''),
+                                )
+                            except Exception as webhook_error:
+                                # Will not mark a 'completed' job as failed
+                                logger.error(f"Failed to run webhook for {request_id}: {webhook_error}")
+                        else:
+                            logger.info(f"No webhook configuration found for {request_id}")
+                    else:
+                        logger.debug(
+                            f"No request data for {request_id}; "
+                            f"skipping webhook dispatch"
                         )
-                    except Exception as webhook_error:
-                        # Will not mark a 'completed' job job as failed
-                        logger.error(f"Failed to run webhook for {request_id}: {webhook_error}")
-                else:
-                    logger.info(f"No webhook configuration found for {request_id}")
+                except Exception as finally_error:
+                    logger.exception(
+                        f"Unexpected error in postprocess finally for {request_id}: "
+                        f"{finally_error}"
+                    )
+
                 # Clean up the request store
                 try:
                     await self.request_store.delete(request_id)
