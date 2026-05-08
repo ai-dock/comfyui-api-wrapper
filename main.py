@@ -183,11 +183,95 @@ def _shape_result(result, request: "Request | None" = None):
     return result.model_copy(update={"comfyui_response": {}})
 
 
+async def _probe_backend(urls: dict) -> dict:
+    """HTTP + WebSocket reachability probe for one ComfyUI backend.
+
+    Used by both ``/health`` (synchronous status snapshot) and the
+    startup announcer below (waits for every backend before declaring
+    readiness). Returning a dict rather than a bool keeps the
+    ``/health`` body shape stable while letting the announcer just
+    check ``http_ok and websocket_ok``.
+    """
+    info = {"base": urls["base"], "http_ok": False, "websocket_ok": False}
+    try:
+        t = aiohttp.ClientTimeout(total=5)
+        async with aiohttp.ClientSession(timeout=t) as session:
+            async with session.get(urls["system_stats"]) as r:
+                if r.status == 200:
+                    info["http_ok"] = True
+                    info["system_stats"] = await r.json()
+                else:
+                    info["http_error"] = f"system_stats returned {r.status}"
+    except aiohttp.ClientError as e:
+        info["http_error"] = f"connect failed: {e}"
+    except Exception as e:
+        info["http_error"] = f"unexpected: {e}"
+
+    try:
+        t = aiohttp.ClientTimeout(total=2.0)
+        async with aiohttp.ClientSession(timeout=t) as session:
+            async with session.ws_connect(
+                urls["websocket"], params={"clientId": "healthcheck"}
+            ) as ws:
+                info["websocket_ok"] = True
+                await ws.close()
+    except Exception as e:
+        info["websocket_error"] = f"{e}"
+
+    return info
+
+
+# Tunable for tests; production default mirrors convert-workflows.sh's
+# COMFYUI_READY_TIMEOUT so we won't park startup forever while ComfyUI
+# is still loading models.
+_BACKENDS_READY_TIMEOUT_S       = 600
+_BACKENDS_READY_POLL_INTERVAL_S = 2
+
+
+async def _announce_backends_ready() -> None:
+    """Probe every configured backend until all reach HTTP+WS ready,
+    then emit a single ``BACKENDS_READY`` log line.
+
+    Pyworkers watching the api-wrapper log key ``MODEL_LOAD_LOG_MSG``
+    off this token instead of uvicorn's ``Uvicorn running on`` —
+    that earlier line only confirms our own listener is bound, but
+    here we're confirming the full stack (api-wrapper + ComfyUI) is
+    actually serviceable, so warm-up benchmarks can't fire against a
+    half-ready pod.
+
+    On timeout we emit ``BACKENDS_READY_TIMEOUT`` so the pyworker's
+    ``MODEL_ERROR_LOG_MSGS`` can pick it up and mark the worker
+    errored rather than letting it sit indefinitely "loading".
+    """
+    deadline = time.monotonic() + _BACKENDS_READY_TIMEOUT_S
+    while time.monotonic() < deadline:
+        infos = [await _probe_backend(comfyui_urls(b)) for b in COMFYUI_BACKENDS]
+        ready = sum(1 for i in infos if i["http_ok"] and i["websocket_ok"])
+        if ready == len(COMFYUI_BACKENDS):
+            logger.info(
+                "BACKENDS_READY: %d backend(s) reachable, ready to serve",
+                len(COMFYUI_BACKENDS),
+            )
+            return
+        logger.debug(
+            "Backend readiness: %d/%d ready, retrying", ready, len(COMFYUI_BACKENDS)
+        )
+        await asyncio.sleep(_BACKENDS_READY_POLL_INTERVAL_S)
+    logger.error(
+        "BACKENDS_READY_TIMEOUT: not all of %d backend(s) reachable after %ds",
+        len(COMFYUI_BACKENDS),
+        _BACKENDS_READY_TIMEOUT_S,
+    )
+
+
 @app.on_event("startup")
 async def startup_event():
     """Initialize workers on startup"""
     try:
         asyncio.create_task(main())
+        # Backend reachability is announced separately so the pyworker
+        # can wait for the *full* stack rather than just uvicorn binding.
+        asyncio.create_task(_announce_backends_ready())
         logger.info("Workers initialized successfully")
     except Exception as e:
         logger.error(f"Failed to initialize workers: {e}")
@@ -951,43 +1035,9 @@ async def health(response: Response):
     backends_detail = []
     n_healthy = 0
 
-    async def _probe(urls: dict) -> dict:
-        """One backend's HTTP + WS probe."""
-        info = {
-            "base":         urls["base"],
-            "http_ok":      False,
-            "websocket_ok": False,
-        }
-        try:
-            t = aiohttp.ClientTimeout(total=5)
-            async with aiohttp.ClientSession(timeout=t) as session:
-                async with session.get(urls["system_stats"]) as r:
-                    if r.status == 200:
-                        info["http_ok"] = True
-                        info["system_stats"] = await r.json()
-                    else:
-                        info["http_error"] = f"system_stats returned {r.status}"
-        except aiohttp.ClientError as e:
-            info["http_error"] = f"connect failed: {e}"
-        except Exception as e:
-            info["http_error"] = f"unexpected: {e}"
-
-        try:
-            t = aiohttp.ClientTimeout(total=2.0)
-            async with aiohttp.ClientSession(timeout=t) as session:
-                async with session.ws_connect(
-                    urls["websocket"], params={"clientId": "healthcheck"}
-                ) as ws:
-                    info["websocket_ok"] = True
-                    await ws.close()
-        except Exception as e:
-            info["websocket_error"] = f"{e}"
-
-        return info
-
     for backend_url in COMFYUI_BACKENDS:
         urls = comfyui_urls(backend_url)
-        info = await _probe(urls)
+        info = await _probe_backend(urls)
         # Per-backend GPU latch.
         gpu_state = get_gpu_state(backend_url)
         info["gpu"] = gpu_state
