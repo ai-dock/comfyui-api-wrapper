@@ -38,12 +38,18 @@ _GPU_STATE: Dict[str, Dict[str, Any]] = {}
 def mark_gpu_unrecoverable(backend_url: str, reason: str) -> None:
     """Latch the GPU-unrecoverable flag for `backend_url`. Idempotent
     per backend — preserves the first reason recorded so the operator
-    sees the originating fault rather than a downstream one."""
+    sees the originating fault rather than a downstream one.
+
+    The log line carries the ``BACKEND_UNRECOVERABLE`` token so any
+    pyworker tailing this log can match it via
+    ``MODEL_ERROR_LOG_MSGS`` and propagate the failure upstream
+    instead of waiting indefinitely for a recovery that won't come.
+    """
     state = _GPU_STATE.setdefault(backend_url, {"unrecoverable": False, "reason": ""})
     if not state["unrecoverable"]:
         state["unrecoverable"] = True
         state["reason"] = reason or "unspecified"
-        logger.error(f"GPU on {backend_url} latched as unrecoverable: {reason}")
+        logger.error(f"BACKEND_UNRECOVERABLE: GPU on {backend_url} latched: {reason}")
 
 
 def get_gpu_state(backend_url: Optional[str] = None) -> Dict[str, Any]:
