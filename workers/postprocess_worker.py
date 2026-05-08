@@ -3,6 +3,7 @@ import asyncio
 import logging
 import os  # Still needed for symlink and remove operations
 import shutil
+import time
 from pathlib import Path
 from typing import Dict, List, Optional
 import json
@@ -15,6 +16,37 @@ import aiohttp
 from config import OUTPUT_DIR, S3_CONFIG, S3_ENABLED, WEBHOOK_CONFIG, WEBHOOK_ENABLED
 
 logger = logging.getLogger(__name__)
+
+
+def _close_out_timings(result, postprocess_t0: float) -> None:
+    """Stamp ``postprocess_ms`` and the terminal ``completed_at_ms`` /
+    ``total_ms`` fields on ``result.timings``.
+
+    Called on both success and failure paths in postprocess so the
+    queue→complete delta is recorded regardless of outcome.
+    ``queued_at_ms`` was set when the request was first stored
+    (``main._new_result``); when it's missing for some reason we
+    skip ``total_ms`` rather than computing nonsense.
+
+    Tolerates an absent or None ``timings`` attribute — the postprocess
+    loop has been seen entering with bare stand-in objects (e.g. when
+    ``request_store`` was rebuilt during a rolling upgrade), and a
+    crash here would propagate out of ``work()`` and drain the worker
+    pool.
+    """
+    now_ms = int(time.time() * 1000)
+    timings = getattr(result, "timings", None) or {}
+    timings["postprocess_ms"] = int((time.time() - postprocess_t0) * 1000)
+    timings["completed_at_ms"] = now_ms
+    queued = timings.get("queued_at_ms")
+    if queued:
+        timings["total_ms"] = now_ms - queued
+    try:
+        result.timings = timings
+    except (AttributeError, TypeError):
+        # Read-only / slotted result object — record-keeping is
+        # best-effort, never block the request on it.
+        pass
 
 
 class PostprocessWorker:
@@ -48,6 +80,11 @@ class PostprocessWorker:
             # unbound name if `request_store.get` itself raises.
             request = None
             result = None
+
+            # Stamp at the moment we commit to handling this job; the
+            # ms duration plus completed_at_ms / total_ms get committed
+            # to result.timings just before final write.
+            postprocess_t0 = time.time()
 
             try:
                 # Get request and result from stores
@@ -90,21 +127,32 @@ class PostprocessWorker:
                     result.message = "Processing complete."
                 else:
                     logger.info(f"Job {request_id} already marked as failed, keeping failure status")
-                
+
+                # Close out timings on the terminal write. total_ms is
+                # the queue→complete metric requested for SLO tracking;
+                # stage *_ms come along since each worker brackets its
+                # own block.
+                _close_out_timings(result, postprocess_t0)
+
                 await self.response_store.set(request_id, result)
                 logger.info(f"PostprocessWorker {self.worker_id} completed job: {request_id}")
                 
             except Exception as e:
                 logger.error(f"PostprocessWorker {self.worker_id} failed job {request_id}: {e}")
-                
+
                 try:
                     # Update result to show failure
                     result = await self.response_store.get(request_id)
                     if result:
                         result.status = "failed"
                         result.message = f"Post-processing failed: {str(e)}"
+                        # Failed jobs still want timings — total_ms is
+                        # how long the request was alive end-to-end,
+                        # which is a useful SLO signal regardless of
+                        # success.
+                        _close_out_timings(result, postprocess_t0)
                         await self.response_store.set(request_id, result)
-                    
+
                 except Exception as store_error:
                     logger.error(f"Failed to update result store for {request_id}: {store_error}")
             

@@ -1,6 +1,8 @@
 # preprocess_worker
 import importlib
 import logging
+import time
+
 from modifiers.basemodifier import BaseModifier
 
 logger = logging.getLogger(__name__)
@@ -46,23 +48,28 @@ class PreprocessWorker:
                     await self.postprocess_queue.put(request_id)
                     self.preprocess_queue.task_done()
                     continue
-                
+
+                # Stamp preprocess start; ms duration is committed to
+                # result.timings before we hand off to generation.
+                preprocess_t0 = time.time()
+
                 # Get and initialize the workflow modifier
                 modifier = await self.get_workflow_modifier(
-                    request.input.modifier, 
+                    request.input.modifier,
                     request.input.modifications
                 )
-                
+
                 # Load and modify the workflow
                 await modifier.load_workflow(request.input.workflow_json)
                 request.input.workflow_json = await modifier.get_modified_workflow()
-                
+
                 # Update the request store with modified workflow
                 await self.request_store.set(request_id, request)
-                
+
                 # Update result status to show preprocessing is complete
                 result.status = "processing"
                 result.message = "Preprocessing complete. Queued for generation."
+                result.timings["preprocess_ms"] = int((time.time() - preprocess_t0) * 1000)
                 await self.response_store.set(request_id, result)
                 
                 # Send for ComfyUI generation
