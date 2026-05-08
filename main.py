@@ -118,6 +118,39 @@ def _apply_base64_header(request: Request, payload):
         payload.input.return_outputs_as_base64 = True
 
 
+def _now_ms() -> int:
+    """Wall-clock milliseconds since the epoch.
+
+    Used to populate ``Result.timings``. Wall clock (not monotonic)
+    so the absolute timestamps are meaningful to the operator
+    reading a webhook / log payload, not just the per-stage deltas.
+    """
+    return int(time.time() * 1000)
+
+
+def _new_result(request_id: str) -> Result:
+    """Construct an initial Result with a queue-time timestamp stamped.
+
+    Each worker stage adds its own ``*_ms`` duration; ``postprocess_worker``
+    closes out ``completed_at_ms`` and ``total_ms`` when terminal
+    status is set, so ``timings`` ends up looking like::
+
+        {
+          "queued_at_ms":    1714... (epoch ms, set here),
+          "preprocess_ms":   42,
+          "generation_ms":   1480,
+          "postprocess_ms":  31,
+          "completed_at_ms": 1714... (epoch ms),
+          "total_ms":        1593,
+        }
+
+    The original goal is the queue→complete delta (``total_ms``);
+    the per-stage durations come along essentially for free since
+    every worker already brackets its own work block.
+    """
+    return Result(id=request_id, timings={"queued_at_ms": _now_ms()})
+
+
 # Substrings that classify a `failed` result.message as an upstream
 # connectivity / timeout problem (ComfyUI wasn't reachable, /prompt
 # retries exhausted, ws connection lost) rather than a generation
@@ -554,7 +587,7 @@ async def generate(
             message=f"Worker at capacity ({_MAX_QUEUE_SIZE} in flight); retry shortly",
         )
 
-    result_pending = Result(id=request_id)
+    result_pending = _new_result(request_id)
 
     try:
         # Store request and initial result
@@ -630,7 +663,7 @@ async def generate_sync(
             message=f"Worker at capacity ({_MAX_QUEUE_SIZE} in flight); retry shortly",
         )
 
-    result_pending = Result(id=request_id)
+    result_pending = _new_result(request_id)
     await request_store.set(request_id, payload)
     await response_store.set(request_id, result_pending)
 
@@ -677,7 +710,7 @@ async def generate_stream(
     request_id = payload.input.request_id
     _apply_base64_header(request, payload)
     
-    result_pending = Result(id=request_id)
+    result_pending = _new_result(request_id)
 
     # Backpressure (see /generate for rationale). Stream variant
     # raises HTTPException so FastAPI emits a JSON 503 instead of

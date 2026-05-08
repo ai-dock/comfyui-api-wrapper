@@ -4,6 +4,7 @@ import aiohttp
 import json
 import logging
 import os
+import time
 from typing import Optional, Dict, Any
 from datetime import datetime
 
@@ -203,6 +204,11 @@ class GenerationWorker:
             # Process the job
             logger.info(f"GenerationWorker {self.worker_id} processing job: {request_id}")
 
+            # Stamp at the moment we commit to handling this job,
+            # *before* the store loads — we want to count store
+            # latency too if it ever becomes a thing.
+            generation_t0 = time.time()
+
             try:
                 # Get request and result from stores
                 request = await self.request_store.get(request_id)
@@ -287,6 +293,7 @@ class GenerationWorker:
                 # Update result with success
                 result.status = "generated"
                 result.message = "Generation complete. Queued for post-processing."
+                result.timings["generation_ms"] = int((time.time() - generation_t0) * 1000)
                 result.comfyui_response = comfyui_response
                 # Store execution details in the comfyui_response if needed
                 if execution_result:
