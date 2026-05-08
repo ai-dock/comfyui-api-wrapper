@@ -3,6 +3,7 @@ import asyncio
 import aiohttp
 import json
 import logging
+import os
 from typing import Optional, Dict, Any
 from datetime import datetime
 
@@ -33,6 +34,79 @@ logger = logging.getLogger(__name__)
 # `_attempt_oom_recovery()` calling that backend's `/free`.
 # ----------------------------------------------------------------------
 _GPU_STATE: Dict[str, Dict[str, Any]] = {}
+
+# Per-backend consecutive-failure counter for the "backend persistently
+# unreachable" path. Reset to zero on any successful workflow post.
+# When the count reaches BACKEND_FAILURE_THRESHOLD, that backend is
+# latched as unrecoverable — the assumption is that ComfyUI behind it
+# has died (process killed, hung, deadlocked) and the post_workflow
+# retry loop is no longer making progress, so the worker is useless
+# regardless of how many other backends are healthy.
+_BACKEND_FAILURE_COUNT: Dict[str, int] = {}
+
+# Hand-tuned default: low enough to fail fast on a truly dead backend,
+# high enough to absorb a brief restart blip during model swaps. Each
+# post_workflow attempt already retries 5x internally with linear
+# backoff, so this counter increments per *full* request-level
+# failure (i.e. retries already exhausted, or the failure happened
+# elsewhere in the generation flow).
+def _read_threshold() -> int:
+    raw = os.environ.get("BACKEND_FAILURE_THRESHOLD", "")
+    try:
+        n = int(raw)
+        return n if n > 0 else 3
+    except (TypeError, ValueError):
+        return 3
+
+BACKEND_FAILURE_THRESHOLD = _read_threshold()
+
+
+# Substrings that classify a generation-worker error as a backend
+# connectivity / liveness failure rather than a per-request issue.
+# Hits here count toward BACKEND_FAILURE_THRESHOLD; persistent hits
+# latch the backend as unrecoverable.
+_BACKEND_CONNECTIVITY_TRIGGERS = (
+    "cannot connect",
+    "failed to post workflow after",
+    "network error getting result",
+    "connection refused",
+    "websocket timeout",
+    "timed out",
+)
+
+
+def _is_backend_connectivity_failure(text: str) -> bool:
+    if not text:
+        return False
+    lowered = text.lower()
+    return any(t in lowered for t in _BACKEND_CONNECTIVITY_TRIGGERS)
+
+
+def _record_backend_failure(backend_url: str, reason: str) -> None:
+    """Increment the per-backend failure counter; latch as unrecoverable
+    once we've hit BACKEND_FAILURE_THRESHOLD consecutive failures."""
+    n = _BACKEND_FAILURE_COUNT.get(backend_url, 0) + 1
+    _BACKEND_FAILURE_COUNT[backend_url] = n
+    logger.warning(
+        "Backend %s connectivity failure %d/%d: %s",
+        backend_url, n, BACKEND_FAILURE_THRESHOLD, reason,
+    )
+    if n >= BACKEND_FAILURE_THRESHOLD:
+        mark_gpu_unrecoverable(
+            backend_url,
+            f"backend unreachable for {n} consecutive jobs ({reason})",
+        )
+
+
+def _record_backend_success(backend_url: str) -> None:
+    """Reset the per-backend failure counter on any forward progress.
+
+    A single successful post_workflow proves the backend is alive again,
+    so a brief blip during a model swap doesn't accumulate toward the
+    fatal threshold.
+    """
+    if _BACKEND_FAILURE_COUNT.get(backend_url, 0):
+        _BACKEND_FAILURE_COUNT[backend_url] = 0
 
 
 def mark_gpu_unrecoverable(backend_url: str, reason: str) -> None:
@@ -248,6 +322,16 @@ class GenerationWorker:
                     cuda_reason = _detect_cuda_unrecoverable_reason(error_message)
                     if cuda_reason:
                         mark_gpu_unrecoverable(self.backend_url, cuda_reason)
+                    elif _is_backend_connectivity_failure(error_message):
+                        # ComfyUI on this backend appears dead (process
+                        # crashed, hung, or otherwise unreachable). One
+                        # blip is fine — post_workflow already retries
+                        # 5x — but persistent failures across multiple
+                        # jobs mean the worker isn't doing what the
+                        # autoscaler expects. Latch unrecoverable once
+                        # we've seen BACKEND_FAILURE_THRESHOLD
+                        # consecutive failures.
+                        _record_backend_failure(self.backend_url, error_message)
 
                 try:
                     # Update result to show failure
@@ -379,6 +463,10 @@ class GenerationWorker:
                         response_data = json.loads(response_text)
 
                         if "prompt_id" in response_data:
+                            # Forward progress: any consecutive
+                            # connectivity failures on this backend
+                            # are clearly stale.
+                            _record_backend_success(self.backend_url)
                             return response_data["prompt_id"]
                         if "node_errors" in response_data:
                             error_details = json.dumps(response_data["node_errors"], indent=2)
